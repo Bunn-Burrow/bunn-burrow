@@ -1,0 +1,20 @@
+# Build artifacts
+/bunn-burrow
+/prep_node
+/prep_py
+/guest-agent/bin/
+
+# Go
+*.test
+coverage.out
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+/docs/
