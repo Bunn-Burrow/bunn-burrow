@@ -43,10 +43,17 @@ type VM struct {
 	// LayerMgr creates per-VM writable layers. Optional; when nil, template
 	// based VM creation is unavailable.
 	LayerMgr *storage.LayerManager
+	// NBDMgr maps qcow2 overlays to NBD block devices for Firecracker.
+	// Optional; when nil, template-based VM creation passes the qcow2 path
+	// directly (not supported by Firecracker natively).
+	NBDMgr *storage.NBDManager
 
 	// writableLayer is the path to this VM's writable layer copy when booted
 	// from a template. It is cleared once the layer is released.
 	writableLayer string
+	// nbdDevice is the NBD device path (e.g. /dev/nbd0) assigned to this VM's
+	// overlay. It is cleared once the NBD mapping is released.
+	nbdDevice string
 }
 
 // New creates a VM in the Created state. It validates configuration, allocates
@@ -634,33 +641,55 @@ func (vm *VM) resolveTemplate(ctx context.Context) error {
 		return fmt.Errorf("layer manager not configured")
 	}
 
+	if vm.NBDMgr == nil {
+		vm.TemplateStore.Release(vm.cfg.TemplateID)
+		return fmt.Errorf("NBD manager not configured")
+	}
+
 	layerPath, err := vm.LayerMgr.CreateLayer(vm.cfg.TemplateID, vm.id)
 	if err != nil {
 		vm.TemplateStore.Release(vm.cfg.TemplateID)
 		return fmt.Errorf("create writable layer: %w", err)
 	}
 
+	// Map the qcow2 overlay to an NBD block device. Firecracker does not
+	// understand qcow2 natively; the NBD device exposes the overlay as a raw
+	// block device via qemu-nbd.
+	nbdDevice, err := vm.NBDMgr.Map(layerPath, vm.id)
+	if err != nil {
+		vm.TemplateStore.Release(vm.cfg.TemplateID)
+		_ = vm.LayerMgr.RemoveLayer(vm.id)
+		return fmt.Errorf("map overlay to NBD device: %w", err)
+	}
+
 	vm.mu.Lock()
 	vm.writableLayer = layerPath
-	vm.cfg.RootFS = layerPath
+	vm.nbdDevice = nbdDevice
+	vm.cfg.RootFS = nbdDevice
 	vm.mu.Unlock()
 
 	return nil
 }
 
-// removeWritableLayer releases this VM's writable layer and the template
-// reference it holds. It is idempotent and safe to call after partial creation.
+// removeWritableLayer releases this VM's writable layer, NBD mapping, and the
+// template reference it holds. It is idempotent and safe to call after partial
+// creation.
 func (vm *VM) removeWritableLayer() {
 	vm.mu.Lock()
 	layer := vm.writableLayer
+	nbdDevice := vm.nbdDevice
 	templateID := vm.cfg.TemplateID
 	vm.writableLayer = ""
+	vm.nbdDevice = ""
 	vm.mu.Unlock()
 
-	if layer == "" {
+	if layer == "" && nbdDevice == "" {
 		return
 	}
-	if vm.LayerMgr != nil {
+	if vm.NBDMgr != nil && nbdDevice != "" {
+		_ = vm.NBDMgr.Unmap(vm.id)
+	}
+	if vm.LayerMgr != nil && layer != "" {
 		_ = vm.LayerMgr.RemoveLayer(vm.id)
 	}
 	if vm.TemplateStore != nil && templateID != "" {

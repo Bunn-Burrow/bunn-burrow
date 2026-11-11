@@ -46,6 +46,7 @@ bunn-burrow/
 - Linux kernel with KVM support
 - `mkfs.ext4`, `debugfs` (e2fsprogs)
 - `qemu-img` (qemu-utils) for M5 copy-on-write backing images and overlays
+- `qemu-nbd` for M5 NBD device mapping and M6 snapshots
 - `~/.local/bin/firecracker` or `firecracker` in PATH
 - `~/.local/firecracker/vmlinux` kernel image
 
@@ -106,20 +107,21 @@ FIRECRACKER_BIN=/home/omkar/.local/bin/firecracker \
 - Each workload execution boots a new Firecracker VM
 - `vmm/sandbox.go` uses a different (incompatible) protocol; use the `exec` command in `main.go` instead
 
-## Milestone 4 & 5: Reusable VM Templates, Immutable RootFS & Copy-on-Write Storage
+## Milestone 4, 5 & 6: Templates, COW Storage & Snapshot/Restore
 
 **Status: Implemented**
 
 M4 adds reusable, immutable VM templates. M5 replaces the full per-VM rootfs
-copy with a copy-on-write storage engine so many VMs share one template without
-copying the entire rootfs per VM.
+copy with a copy-on-write storage engine using qcow2 backing images and
+per-VM writable overlays. M6 adds Firecracker VM snapshot and restore.
 
 - **Template management**: `internal/template` — register a prepared rootfs as an immutable template (ID, name, base image, rootfs path/format, architecture, checksum, version), with retrieval, listing, SHA256 integrity validation, and safe deletion (blocked while in use).
 - **Immutable rootfs**: template rootfs and backing image are never opened for write after creation, are chmod read-only, and the rootfs checksum is verified on every VM start.
-- **Copy-on-write storage** (M5): `internal/storage` — one immutable qcow2 backing image per template; one VM-private writable qcow2 overlay per VM. Firecracker serves reads from the shared base and writes to the overlay. No full rootfs copy per VM; `qemu-img` required.
-- **Per-VM writable filesystem**: each VM created from a template (`Config.TemplateID`) boots from an independent qcow2 overlay, cleaned up on VM destroy. Concurrent creation from one template is safe.
-- **Backward compatible**: direct rootfs creation (`Config.RootFS` without `TemplateID`) is preserved.
+- **Copy-on-write storage** (M5): `internal/storage` — one immutable qcow2 backing image per template; one VM-private writable qcow2 overlay per VM; `qemu-img` required. Overlays exposed to Firecracker via NBD (`qemu-nbd`) since Firecracker does not understand qcow2 natively.
+- **Per-VM writable filesystem**: each VM created from a template (`Config.TemplateID`) boots from an independent qcow2 overlay via a unique NBD device, cleaned up on VM destroy. Concurrent creation from one template is safe.
+- **Snapshot & restore** (M6): `vmm/snapshot.go` — crash-consistent snapshots from paused VMs via Firecracker `CreateSnapshot`/`LoadSnapshot`; self-contained overlay copies for snapshot independence; durable `SnapshotStore` with atomic metadata; `RestoreSnapshot` creates independent VMs with unique host-side resources.
+- **Backward compatible**: direct rootfs creation (`Config.RootFS` without `TemplateID`) is preserved. Legacy `Fork`/`restoreVM` API preserved.
 
-See `docs/architecture.md` (M5 section) and `docs/run.md` (M5: Using VM Templates) for details.
+See `docs/architecture.md` (M5/M6 sections) and `docs/run.md` (M5/M6 usage) for details.
 
-**Deferred to M6:** overlay garbage collection for layers orphaned by crashed VMs, a persistent CLI/SDK, and snapshot/restore.
+**Deferred to M7:** overlay garbage collection for layers orphaned by crashed VMs, application-consistent snapshots (guest fsync coordination), a persistent CLI/SDK.
