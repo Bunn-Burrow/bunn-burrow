@@ -18,45 +18,50 @@ import (
 
 // fakeAPI implements API for tests.
 type fakeAPI struct {
-	mu                   sync.Mutex
-	calls                []string
-	instanceState        string
-	machineCfg           *models.MachineConfiguration
-	lastVsock            *models.Vsock
-	lastAction           string
-	putMachineCfgErr     error
-	putBootSourceErr     error
-	putGuestDriveErr     error
-	putGuestVsockErr     error
-	createSyncActionErr  error
-	patchVMErr           error
-	loadSnapshotErr      error
+	mu                  sync.Mutex
+	calls               []string
+	instanceState       string
+	machineCfg          *models.MachineConfiguration
+	lastVsock           *models.Vsock
+	lastAction          string
+	putMachineCfgErr    error
+	putBootSourceErr    error
+	putGuestDriveErr    error
+	putGuestVsockErr    error
+	createSyncActionErr error
+	patchVMErr          error
+	loadSnapshotErr     error
 }
 
 func (f *fakeAPI) PutMachineConfiguration(ctx context.Context, cfg *models.MachineConfiguration) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "PutMachineConfiguration")
 	f.machineCfg = cfg
 	return f.putMachineCfgErr
 }
 func (f *fakeAPI) PutGuestBootSource(ctx context.Context, src *models.BootSource) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "PutGuestBootSource")
 	return f.putBootSourceErr
 }
 func (f *fakeAPI) PutGuestDriveByID(ctx context.Context, driveID string, d *models.Drive) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "PutGuestDriveByID")
 	return f.putGuestDriveErr
 }
 func (f *fakeAPI) PutGuestVsock(ctx context.Context, vsock *models.Vsock) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "PutGuestVsock")
 	f.lastVsock = vsock
 	return f.putGuestVsockErr
 }
 func (f *fakeAPI) CreateSyncAction(ctx context.Context, action *models.InstanceActionInfo) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "CreateSyncAction")
 	if action.ActionType != nil {
 		f.lastAction = *action.ActionType
@@ -64,7 +69,8 @@ func (f *fakeAPI) CreateSyncAction(ctx context.Context, action *models.InstanceA
 	return f.createSyncActionErr
 }
 func (f *fakeAPI) PatchVM(ctx context.Context, vm *models.VM) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "PatchVM")
 	if vm.State != nil {
 		f.instanceState = *vm.State
@@ -72,22 +78,26 @@ func (f *fakeAPI) PatchVM(ctx context.Context, vm *models.VM) error {
 	return f.patchVMErr
 }
 func (f *fakeAPI) CreateSnapshot(ctx context.Context, p *models.SnapshotCreateParams) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "CreateSnapshot")
 	return nil
 }
 func (f *fakeAPI) LoadSnapshot(ctx context.Context, p *models.SnapshotLoadParams) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "LoadSnapshot")
 	return f.loadSnapshotErr
 }
 func (f *fakeAPI) GetInstanceInfo(ctx context.Context) (*models.InstanceInfo, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "GetInstanceInfo")
 	return &models.InstanceInfo{State: &f.instanceState}, nil
 }
 func (f *fakeAPI) GetMachineConfiguration(ctx context.Context) (*models.MachineConfiguration, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, "GetMachineConfiguration")
 	return f.machineCfg, nil
 }
@@ -362,4 +372,44 @@ func TestForkRequiresPaused(t *testing.T) {
 	_, err = vm.Fork(context.Background(), ForkOpts{CopyRootFS: true})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "paused")
+}
+
+func TestStopEscalatesToKillAndWaitsForReap(t *testing.T) {
+	c := testConfig(t)
+	c.StopTimeout = 50 * time.Millisecond
+	c.StopGraceTimeout = 2 * time.Second
+
+	vm, err := New(c, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, vm.sm.Transition(StateCreated, StatePreparing))
+	require.NoError(t, vm.sm.Transition(StatePreparing, StateRunning))
+
+	vm.mu.Lock()
+	vm.api = &fakeAPI{}
+	vm.mu.Unlock()
+
+	// Ignore SIGTERM so Stop must escalate to SIGKILL.
+	proc, err := Start("sh", []string{
+		"-c", `trap '' TERM; exec sleep 100`,
+	}, nil)
+	require.NoError(t, err)
+
+	vm.mu.Lock()
+	vm.proc = proc
+	vm.mu.Unlock()
+
+	go vm.monitorExit()
+
+	err = vm.Stop(context.Background())
+	require.NoError(t, err)
+
+	select {
+	case <-proc.Exited():
+	case <-time.After(2 * time.Second):
+		t.Fatal("process was not reaped")
+	}
+
+	require.True(t, proc.Reaped())
+	require.Equal(t, StateStopped, vm.State())
 }

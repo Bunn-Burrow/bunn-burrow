@@ -14,8 +14,8 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	cacheDir := "/tmp/bunn-burrow-cache"
-	guestAgent := "/home/omkar/sandbox/guest-agent/bin/guest-agent-static"
+	cacheDir := "/home/omkar/bunn-burrow/cache"
+	guestAgent := "/home/omkar/bunn-burrow/guest-agent/bin/guest-agent-static"
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

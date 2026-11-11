@@ -59,6 +59,7 @@ func Start(binary string, args []string, env []string, consolePath ...string) (*
 // Exited. It is safe for concurrent use.
 func (p *Process) wait() {
 	err := p.cmd.Wait()
+
 	p.mu.Lock()
 	p.exitErr = err
 	p.reaped = true

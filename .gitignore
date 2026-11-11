@@ -18,3 +18,4 @@ coverage.out
 .idea/
 .DS_Store
 /docs/
+/cache/

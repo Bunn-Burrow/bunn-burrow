@@ -387,6 +387,14 @@ func (vm *VM) Stop(ctx context.Context) error {
 		vm.mu.Unlock()
 		return nil
 	case StateRunning, StatePaused:
+	case StateStopping:
+		vm.mu.Unlock()
+		select {
+		case <-vm.exitCh:
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("stop: waiting for existing shutdown: %w", ctx.Err())
+		}
 	default:
 		vm.mu.Unlock()
 		return fmt.Errorf("stop: invalid state %q", state)
@@ -424,6 +432,22 @@ func (vm *VM) Stop(ctx context.Context) error {
 	case <-vm.exitCh:
 		goto terminated
 	case <-time.After(vm.cfg.StopGraceTimeout):
+		proc := vm.process()
+
+		fields := logrus.Fields{
+			"state": vm.State(),
+		}
+
+		if proc != nil {
+			fields["pid"] = proc.PID()
+			fields["reaped"] = proc.Reaped()
+			fields["exitErr"] = proc.ExitError()
+		}
+
+		vm.logger.WithFields(fields).Error(
+			"Firecracker termination wait timed out",
+		)
+
 		return fmt.Errorf("stop: firecracker did not terminate after escalation")
 	}
 

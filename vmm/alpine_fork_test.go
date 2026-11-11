@@ -2,6 +2,7 @@ package vmm
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -9,6 +10,9 @@ import (
 )
 
 func TestTemporaryAlpineForkRestore(t *testing.T) {
+	if os.Getenv("BUNN_RUN_FIRECRACKER_SNAPSHOT_TEST") != "1" {
+		t.Skip("requires explicit opt-in; Firecracker v1.17.0 snapshot restore has a known vsock socket conflict")
+	}
 	bin := "/home/omkar/.local/bin/firecracker"
 	kernel := "/home/omkar/.local/firecracker/vmlinux"
 	rootfs := "/home/omkar/.local/firecracker/alpine/alpine-rootfs.ext4"

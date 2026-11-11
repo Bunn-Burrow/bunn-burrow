@@ -48,16 +48,17 @@ func run(args []string) error {
 	logger.SetOutput(os.Stderr)
 
 	cfg := vmm.Config{
-		KernelImage:  *kernel,
-		RootFS:       *rootfs,
-		WorkDir:      *workdir,
-		VCPU:         *vcpu,
-		MemSizeMiB:   *mem,
-		VsockCID:     uint32(*cid),
-		VsockPort:    uint32(*port),
-		BinPath:      *bin,
-		StartTimeout: 30 * time.Second,
-		StopTimeout:  20 * time.Second,
+		KernelImage:      *kernel,
+		RootFS:           *rootfs,
+		WorkDir:          *workdir,
+		VCPU:             *vcpu,
+		MemSizeMiB:       *mem,
+		VsockCID:         uint32(*cid),
+		VsockPort:        uint32(*port),
+		BinPath:          *bin,
+		StartTimeout:     30 * time.Second,
+		StopTimeout:      20 * time.Second,
+		StopGraceTimeout: 5 * time.Second,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -210,9 +211,9 @@ connected:
 
 	// Protocol handshake.
 	if err := conn.sendFrame(map[string]any{
-		"kind":      "protocol",
-		"protocol":  "bunn-vsock",
-		"version":   float64(1),
+		"kind":     "protocol",
+		"protocol": "bunn-vsock",
+		"version":  float64(1),
 	}); err != nil {
 		return fmt.Errorf("send protocol: %w", err)
 	}
@@ -251,9 +252,9 @@ func sendShutdown(ctx context.Context, vm *vmm.VM, logger *logrus.Logger) error 
 	defer conn.Close()
 
 	if err := conn.sendFrame(map[string]any{
-		"kind":      "protocol",
-		"protocol":  "bunn-vsock",
-		"version":   float64(1),
+		"kind":     "protocol",
+		"protocol": "bunn-vsock",
+		"version":  float64(1),
 	}); err != nil {
 		return fmt.Errorf("send protocol: %w", err)
 	}
@@ -354,9 +355,9 @@ connected:
 	defer conn.Close()
 
 	if err := conn.sendFrame(map[string]any{
-		"kind":      "protocol",
-		"protocol":  "bunn-vsock",
-		"version":   float64(1),
+		"kind":     "protocol",
+		"protocol": "bunn-vsock",
+		"version":  float64(1),
 	}); err != nil {
 		return fmt.Errorf("send protocol: %w", err)
 	}
@@ -394,9 +395,9 @@ func sendExecute(ctx context.Context, vm *vmm.VM, execID, command string, args [
 	defer conn.Close()
 
 	if err := conn.sendFrame(map[string]any{
-		"kind":          "protocol",
-		"protocol":      "bunn-vsock",
-		"version":       float64(1),
+		"kind":     "protocol",
+		"protocol": "bunn-vsock",
+		"version":  float64(1),
 	}); err != nil {
 		return fmt.Errorf("send protocol: %w", err)
 	}
@@ -411,14 +412,14 @@ func sendExecute(ctx context.Context, vm *vmm.VM, execID, command string, args [
 	}
 
 	if err := conn.sendFrame(map[string]any{
-		"kind":             "execute",
-		"execution_id":     execID,
-		"command":          command,
-		"args":             args,
-		"env":              envMap,
-		"working_dir":      workdir,
-		"user":             user,
-		"timeout_seconds":  timeout.Seconds(),
+		"kind":            "execute",
+		"execution_id":    execID,
+		"command":         command,
+		"args":            args,
+		"env":             envMap,
+		"working_dir":     workdir,
+		"user":            user,
+		"timeout_seconds": timeout.Seconds(),
 	}); err != nil {
 		return fmt.Errorf("send execute: %w", err)
 	}
