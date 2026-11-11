@@ -25,27 +25,28 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Verify Go formatting
+      # ---- Root module checks ----
+      - name: Verify Go formatting (root module)
         run: |
           gofmt -l .
           if [ -n "$(gofmt -l .)" ]; then
-            echo "::error::Go formatting issues found. Run 'gofmt -w .' to fix."
+            echo "::error::Go formatting issues found in root module. Run 'gofmt -w .' to fix."
             exit 1
           fi
 
-      - name: Verify module dependency consistency
+      - name: Verify module dependency consistency (root module)
         run: go mod verify
 
-      - name: Run go vet
+      - name: Run go vet (root module)
         run: go vet ./...
 
-      - name: Build all packages
+      - name: Build all packages (root module)
         run: go build ./...
 
-      - name: Run tests
+      - name: Run tests (root module)
         run: go test -count=1 ./...
 
-      - name: Run tests with race detector
+      - name: Run tests with race detector (root module)
         run: go test -race ./...
 
       - name: Build Guest Agent
@@ -53,10 +54,48 @@ jobs:
           cd guest-agent
           GOWORK=off CGO_ENABLED=0 go build ./...
 
+      # ---- bunn-cli module checks ----
+      - name: Verify Go formatting (bunn-cli)
+        working-directory: bunn-cli
+        run: |
+          gofmt -l .
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "::error::Go formatting issues found in bunn-cli. Run 'gofmt -w .' to fix."
+            exit 1
+          fi
+
+      - name: Verify module dependency consistency (bunn-cli)
+        working-directory: bunn-cli
+        run: go mod verify
+
+      - name: Run go vet (bunn-cli)
+        working-directory: bunn-cli
+        run: go vet ./...
+
+      - name: Build bunn CLI binary
+        working-directory: bunn-cli
+        run: |
+          go build -o bunn ./cmd/bunn
+
+      - name: Run tests (bunn-cli)
+        working-directory: bunn-cli
+        run: go test -count=1 ./...
+
+      - name: Run tests with race detector (bunn-cli)
+        working-directory: bunn-cli
+        run: go test -race ./...
+
       - name: Check for whitespace errors
         run: git diff --check
 
       - name: Run Go vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+        working-directory: .
+
+      - name: Run Go vulnerability scan (bunn-cli)
+        working-directory: bunn-cli
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...

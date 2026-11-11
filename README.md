@@ -22,6 +22,11 @@ bunn-burrow/
 │   ├── prep_py/          # Temporary Python environment prep
 │   ├── prep_node/        # Temporary Node.js environment prep
 │   └── test/             # Temporary M3 integration test harness
+├── bunn-cli/                 # Independent CLI module (binary: `bunn`)
+│   ├── cmd/bunn/             # CLI entrypoint
+│   ├── internal/             # CLI packages (cli, config, output, doctor, buildinfo)
+│   ├── Makefile              # Build targets
+│   └── README.md             # CLI-specific documentation
 ├── docs/                 # Human-facing documentation
 ├── guest-agent/
 │   ├── bin/              # Built guest agent binaries
@@ -81,6 +86,17 @@ CGO_ENABLED=0 go build -o bin/guest-agent-static ./cmd/guest-agent
 
 The prepared environment is cached. Subsequent preparations of the same image are cache hits.
 
+### 5. Build the bunn CLI (optional)
+
+```bash
+cd bunn-cli
+make build
+```
+
+The binary is named `bunn` and provides developer-facing commands for VM lifecycle,
+configuration, and runtime diagnostics. See [bunn-cli/README.md](bunn-cli/README.md)
+for full CLI documentation.
+
 ### 4. Execute a workload
 
 ```bash
@@ -100,6 +116,28 @@ FIRECRACKER_BIN=/home/omkar/.local/bin/firecracker \
 - [docs/architecture.md](docs/architecture.md) - Architecture details
 - [docs/runtime-guide.md](docs/runtime-guide.md) - Running workloads by runtime
 - [docs/troubleshooting.md](docs/troubleshooting.md) - Common issues and fixes
+- [bunn-cli/README.md](bunn-cli/README.md) - CLI build, configuration, and command reference
+
+## bunn CLI Reference
+
+The `bunn` CLI (in `bunn-cli/`) is an independent Go module providing developer-facing
+commands for the local runtime:
+
+| Command | Description |
+|---------|-------------|
+| `bunn version` | Print CLI version |
+| `bunn doctor` | Diagnose runtime health |
+| `bunn config init` | Initialize config file |
+| `bunn config view` | View effective config |
+| `bunn config path` | Print config file path |
+| `bunn runtime list` | List runtime capabilities |
+| `bunn runtime inspect` | Inspect resolved configuration |
+| `bunn vm run` | Start a VM |
+| `bunn vm list` | List VMs in this session |
+| `bunn vm stop` | Stop a VM |
+| `bunn vm delete` | Delete a VM |
+
+All commands support `--output table\|json\|text` and `--color auto\|always\|never`.
 
 ## Contributing
 
@@ -128,7 +166,6 @@ the full development workflow, coding standards, and pull request process.
 
 ## Current Limitations
 
-- No permanent CLI or SDK (temporary harnesses only)
 - Guest Agent must be manually injected into OCI rootfs during preparation
 - No guest networking (vsock only for host↔guest communication)
 - Each workload execution boots a new Firecracker VM
