@@ -1,0 +1,28 @@
+# Line endings and file normalization
+
+# Go source files - use LF line endings
+*.go text eol=lf
+
+# Documentation - use LF line endings
+*.md text eol=lf
+
+# YAML workflow files - use LF line endings
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# JSON - use LF line endings
+*.json text eol=lf
+
+# Git configuration
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# Go module files - use LF line endings
+go.mod text eol=lf
+go.sum text eol=lf
+
+# Ignore generated files
+*.exe -text
+*.dll -text
+*.so -text
+*.dylib -text

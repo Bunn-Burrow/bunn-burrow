@@ -16,9 +16,13 @@ import (
 //
 // Firecracker listens on a Unix domain socket (uds_path). A host connection is
 // established by dialing that socket and sending the handshake
-//   CONNECT <guest-port>\n
+//
+//	CONNECT <guest-port>\n
+//
 // and reading the acknowledgement
-//   OK <assigned-host-port>\n
+//
+//	OK <assigned-host-port>\n
+//
 // After the handshake, the connection is a regular net.Conn to the guest's
 // vsock port.
 //

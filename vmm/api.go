@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	"github.com/firecracker-microvm/firecracker-go-sdk"
+	models "github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	"github.com/sirupsen/logrus"
 )
 

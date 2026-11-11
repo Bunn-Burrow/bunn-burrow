@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify Go formatting
+        run: |
+          gofmt -l .
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "::error::Go formatting issues found. Run 'gofmt -w .' to fix."
+            exit 1
+          fi
+
+      - name: Verify module dependency consistency
+        run: go mod verify
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Run tests
+        run: go test -count=1 ./...
+
+      - name: Run tests with race detector
+        run: go test -race ./...
+
+      - name: Build Guest Agent
+        run: |
+          cd guest-agent
+          GOWORK=off CGO_ENABLED=0 go build ./...
+
+      - name: Check for whitespace errors
+        run: git diff --check
+
+      - name: Run Go vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

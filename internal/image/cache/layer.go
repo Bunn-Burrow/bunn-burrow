@@ -14,22 +14,22 @@ import (
 // LayerCache is a persistent, content-addressed cache for OCI image layers.
 // Layers are stored by their SHA256 digest and verified before reuse.
 type LayerCache struct {
-	dir      string
-	mu       sync.Mutex
+	dir       string
+	mu        sync.Mutex
 	downloads map[string]*downloadTracker
 }
 
 // downloadTracker tracks an in-flight download to avoid duplicate downloads.
 type downloadTracker struct {
-	done   chan struct{}
-	err    error
+	done chan struct{}
+	err  error
 }
 
 // New creates a LayerCache at the given directory.
 func New(dir string) *LayerCache {
 	return &LayerCache{
-		dir:        dir,
-		downloads:  make(map[string]*downloadTracker),
+		dir:       dir,
+		downloads: make(map[string]*downloadTracker),
 	}
 }
 
@@ -217,7 +217,7 @@ func (c *LayerCache) CleanupTemp() error {
 
 // Stats returns cache statistics.
 type Stats struct {
-	Layers   int
+	Layers    int
 	SizeBytes int64
 }
 

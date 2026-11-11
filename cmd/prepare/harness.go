@@ -256,9 +256,9 @@ connected:
 	defer conn.Close()
 
 	if err := conn.sendFrame(map[string]any{
-		"kind":      "protocol",
-		"protocol":  "bunn-vsock",
-		"version":   float64(1),
+		"kind":     "protocol",
+		"protocol": "bunn-vsock",
+		"version":  float64(1),
 	}); err != nil {
 		return fmt.Errorf("send protocol: %w", err)
 	}
@@ -295,9 +295,9 @@ func sendShutdown(ctx context.Context, vm *vmm.VM) error {
 	defer conn.Close()
 
 	if err := conn.sendFrame(map[string]any{
-		"kind":      "protocol",
-		"protocol":  "bunn-vsock",
-		"version":   float64(1),
+		"kind":     "protocol",
+		"protocol": "bunn-vsock",
+		"version":  float64(1),
 	}); err != nil {
 		return fmt.Errorf("send protocol: %w", err)
 	}

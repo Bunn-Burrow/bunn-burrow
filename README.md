@@ -1,5 +1,7 @@
 # Bunn Burrow
 
+[![CI](https://github.com/omkar/sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/omkar/sandbox/actions/workflows/ci.yml)
+
 Isolated execution platform for developers and AI agents using Firecracker microVMs and OCI container images.
 
 ## Architecture Overview
@@ -98,6 +100,31 @@ FIRECRACKER_BIN=/home/omkar/.local/bin/firecracker \
 - [docs/architecture.md](docs/architecture.md) - Architecture details
 - [docs/runtime-guide.md](docs/runtime-guide.md) - Running workloads by runtime
 - [docs/troubleshooting.md](docs/troubleshooting.md) - Common issues and fixes
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for
+the full development workflow, coding standards, and pull request process.
+
+### Quick contribution checklist
+
+1. Create a branch from `main` (e.g., `feature/description`)
+2. Implement your changes
+3. Run local validation:
+
+   ```bash
+   gofmt -l .
+   go mod verify
+   go vet ./...
+   go build ./...
+   go test -count=1 ./...
+   go test -race ./...
+   cd guest-agent && GOWORK=off CGO_ENABLED=0 go build ./...
+   git diff --check
+   ```
+
+4. Commit using Conventional Commits (e.g., `feat:`, `fix:`, `docs:`)
+5. Push and open a pull request against `main`
 
 ## Current Limitations
 

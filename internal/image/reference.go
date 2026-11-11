@@ -8,10 +8,10 @@ import (
 
 // Reference is a parsed OCI image reference.
 type Reference struct {
-	Registry string
+	Registry   string
 	Repository string
-	Tag string
-	Digest string
+	Tag        string
+	Digest     string
 }
 
 // Parse parses an OCI image reference string.

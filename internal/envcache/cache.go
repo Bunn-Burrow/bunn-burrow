@@ -14,16 +14,16 @@ import (
 // Each environment is identified by a deterministic cache key based on the
 // resolved image digest, platform, and Guest Agent version.
 type EnvironmentCache struct {
-	dir   string
-	mu    sync.Mutex
+	dir    string
+	mu     sync.Mutex
 	builds map[string]*buildTracker
 }
 
 // buildTracker tracks an in-flight environment build.
 type buildTracker struct {
-	done  chan struct{}
-	err   error
-	env   *Environment
+	done chan struct{}
+	err  error
+	env  *Environment
 }
 
 // Environment describes a prepared environment ready for Firecracker boot.

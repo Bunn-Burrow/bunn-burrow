@@ -36,27 +36,27 @@ type Config struct {
 	// VsockPort is the guest-side vsock port host connections target.
 	VsockPort uint32
 
-// WorkDir is the base directory under which per-VM working directories are
-// created. If empty, os.MkdirTemp is used.
-WorkDir string
+	// WorkDir is the base directory under which per-VM working directories are
+	// created. If empty, os.MkdirTemp is used.
+	WorkDir string
 
-// BinPath is the path to the Firecracker binary. If empty, "firecracker" is
-// resolved from PATH, falling back to a well-known location.
-BinPath string
+	// BinPath is the path to the Firecracker binary. If empty, "firecracker" is
+	// resolved from PATH, falling back to a well-known location.
+	BinPath string
 
-// LogFile is where Firecracker writes its log.
-LogFile string
+	// LogFile is where Firecracker writes its log.
+	LogFile string
 
-// RootFSReadOnly makes the guest root filesystem read-only. Used when several
-// VMs share one rootfs image (e.g. an unforked snapshot) to prevent concurrent
-// writes.
-RootFSReadOnly bool
+	// RootFSReadOnly makes the guest root filesystem read-only. Used when several
+	// VMs share one rootfs image (e.g. an unforked snapshot) to prevent concurrent
+	// writes.
+	RootFSReadOnly bool
 
-// TemplateID optionally references a registered template to use as the VM's
-// rootfs source. When set, the template's rootfs is copied to a per-VM writable
-// layer before boot and RootFS need not be set directly. When empty, direct
-// rootfs creation is used (backward compatible).
-TemplateID string
+	// TemplateID optionally references a registered template to use as the VM's
+	// rootfs source. When set, the template's rootfs is copied to a per-VM writable
+	// layer before boot and RootFS need not be set directly. When empty, direct
+	// rootfs creation is used (backward compatible).
+	TemplateID string
 
 	// StartTimeout bounds the wait for Firecracker to initialize its API socket.
 	StartTimeout time.Duration

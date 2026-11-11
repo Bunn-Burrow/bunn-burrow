@@ -11,17 +11,18 @@ import (
 // operations this implementation performs and owns.
 //
 // Allowed transitions:
-//   Created   -> Preparing   (firecracker process launched, API socket awaited)
-//   Preparing -> Running     (devices configured, instance started)
-//   Running   -> Paused      (pause requested)
-//   Paused    -> Running     (resume requested)
-//   Paused    -> Snapshotting(snapshot requested)
-//   Snapshotting -> Paused   (snapshot complete)
-//   Running   -> Stopping    (stop requested)
-//   Stopping  -> Stopped     (process termination confirmed)
-//   Stopped   -> Destroying  (destroy requested)
-//   Destroying -> Destroyed  (resources cleaned)
-//   any       -> Failed      (terminal error)
+//
+//	Created   -> Preparing   (firecracker process launched, API socket awaited)
+//	Preparing -> Running     (devices configured, instance started)
+//	Running   -> Paused      (pause requested)
+//	Paused    -> Running     (resume requested)
+//	Paused    -> Snapshotting(snapshot requested)
+//	Snapshotting -> Paused   (snapshot complete)
+//	Running   -> Stopping    (stop requested)
+//	Stopping  -> Stopped     (process termination confirmed)
+//	Stopped   -> Destroying  (destroy requested)
+//	Destroying -> Destroyed  (resources cleaned)
+//	any       -> Failed      (terminal error)
 //
 // Stop and Destroy are idempotent: Stopping/Stopped/Destroyed are stable
 // under repeated stop/destroy calls.
@@ -65,8 +66,8 @@ var idempotentStop = map[State]struct{}{
 // StateMachine validates and performs state transitions. It is safe for
 // concurrent use.
 type StateMachine struct {
-	mu   sync.Mutex
-	cond *sync.Cond
+	mu    sync.Mutex
+	cond  *sync.Cond
 	state State
 }
 
