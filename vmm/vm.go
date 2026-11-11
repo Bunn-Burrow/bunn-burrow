@@ -14,6 +14,9 @@ import (
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+
+	"github.com/omkar/sandbox/internal/storage"
+	"github.com/omkar/sandbox/internal/template"
 )
 
 // VM owns a Firecracker microVM instance: its lifecycle state, process handle,
@@ -33,6 +36,17 @@ type VM struct {
 	exitErr   error
 	snapshot  *SnapshotInfo
 	logger    *logrus.Entry
+
+	// TemplateStore resolves templates for template-based VM creation. Optional;
+	// when nil, only direct rootfs creation is supported (backward compatible).
+	TemplateStore *template.Store
+	// LayerMgr creates per-VM writable layers. Optional; when nil, template
+	// based VM creation is unavailable.
+	LayerMgr *storage.LayerManager
+
+	// writableLayer is the path to this VM's writable layer copy when booted
+	// from a template. It is cleared once the layer is released.
+	writableLayer string
 }
 
 // New creates a VM in the Created state. It validates configuration, allocates
@@ -120,6 +134,24 @@ func (vm *VM) Snapshot() *SnapshotInfo {
 func (vm *VM) Start(ctx context.Context) error {
 	if err := vm.sm.Transition(StateCreated, StatePreparing); err != nil {
 		return fmt.Errorf("start: %w", err)
+	}
+
+	// Resolve the template and prepare per-VM writable storage before Firecracker
+	// starts. If a layer is created but startup later fails, it is cleaned up by
+	// the deferred removal below.
+	var layerCreated bool
+	defer func() {
+		if layerCreated && vm.State() != StateRunning {
+			vm.removeWritableLayer()
+		}
+	}()
+
+	if vm.cfg.TemplateID != "" {
+		if err := vm.resolveTemplate(ctx); err != nil {
+			vm.sm.TransitionTo(StateFailed)
+			return err
+		}
+		layerCreated = true
 	}
 
 	if err := vm.startProcessAndWait(ctx); err != nil {
@@ -514,6 +546,8 @@ func (vm *VM) Destroy(ctx context.Context) error {
 		errs = append(errs, fmt.Errorf("remove artifacts: %w", err))
 	}
 
+	vm.removeWritableLayer()
+
 	vm.mu.Lock()
 	vm.api = nil
 	vm.proc = nil
@@ -573,6 +607,67 @@ func (vm *VM) removeOwnedArtifacts() error {
 	return errors.Join(errs...)
 }
 
+// resolveTemplate looks up the configured template, validates its integrity,
+// acquires a reference, and creates this VM's independent writable layer. The
+// VM's RootFS is then pointed at the layer copy so Firecracker boots from it.
+// The template rootfs itself is never attached writably to any VM.
+func (vm *VM) resolveTemplate(ctx context.Context) error {
+	if vm.TemplateStore == nil {
+		return fmt.Errorf("template id %q set but no template store configured", vm.cfg.TemplateID)
+	}
+
+	tmpl := vm.TemplateStore.Get(vm.cfg.TemplateID)
+	if tmpl == nil {
+		return fmt.Errorf("template %q not found", vm.cfg.TemplateID)
+	}
+
+	if err := vm.TemplateStore.Validate(vm.cfg.TemplateID); err != nil {
+		return fmt.Errorf("template %q validation failed: %w", vm.cfg.TemplateID, err)
+	}
+
+	if err := vm.TemplateStore.Acquire(vm.cfg.TemplateID); err != nil {
+		return fmt.Errorf("acquire template %q: %w", vm.cfg.TemplateID, err)
+	}
+
+	if vm.LayerMgr == nil {
+		vm.TemplateStore.Release(vm.cfg.TemplateID)
+		return fmt.Errorf("layer manager not configured")
+	}
+
+	layerPath, err := vm.LayerMgr.CreateLayer(tmpl.RootfsPath, vm.id)
+	if err != nil {
+		vm.TemplateStore.Release(vm.cfg.TemplateID)
+		return fmt.Errorf("create writable layer: %w", err)
+	}
+
+	vm.mu.Lock()
+	vm.writableLayer = layerPath
+	vm.cfg.RootFS = layerPath
+	vm.mu.Unlock()
+
+	return nil
+}
+
+// removeWritableLayer releases this VM's writable layer and the template
+// reference it holds. It is idempotent and safe to call after partial creation.
+func (vm *VM) removeWritableLayer() {
+	vm.mu.Lock()
+	layer := vm.writableLayer
+	templateID := vm.cfg.TemplateID
+	vm.writableLayer = ""
+	vm.mu.Unlock()
+
+	if layer == "" {
+		return
+	}
+	if vm.LayerMgr != nil {
+		_ = vm.LayerMgr.RemoveLayer(layer)
+	}
+	if vm.TemplateStore != nil && templateID != "" {
+		vm.TemplateStore.Release(templateID)
+	}
+}
+
 // process returns the current Firecracker process handle, or nil if not started.
 // Caller does not hold vm.mu.
 func (vm *VM) process() *Process {
@@ -614,6 +709,7 @@ func (vm *VM) destroy(ctx context.Context, force bool) error {
 	}
 	_ = vm.releaseRuntime()
 	_ = vm.removeOwnedArtifacts()
+	vm.removeWritableLayer()
 	vm.sm.TransitionTo(StateDestroyed)
 	return nil
 }

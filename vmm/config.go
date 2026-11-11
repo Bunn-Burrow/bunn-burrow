@@ -52,6 +52,12 @@ LogFile string
 // writes.
 RootFSReadOnly bool
 
+// TemplateID optionally references a registered template to use as the VM's
+// rootfs source. When set, the template's rootfs is copied to a per-VM writable
+// layer before boot and RootFS need not be set directly. When empty, direct
+// rootfs creation is used (backward compatible).
+TemplateID string
+
 	// StartTimeout bounds the wait for Firecracker to initialize its API socket.
 	StartTimeout time.Duration
 
@@ -88,10 +94,12 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("kernel image not statable: %w", err))
 	}
 
-	if c.RootFS == "" {
-		errs = append(errs, errors.New("root filesystem path is required"))
-	} else if _, err := os.Stat(c.RootFS); err != nil {
-		errs = append(errs, fmt.Errorf("root filesystem not statable: %w", err))
+	if c.RootFS == "" && c.TemplateID == "" {
+		errs = append(errs, errors.New("root filesystem path or template id is required"))
+	} else if c.RootFS != "" {
+		if _, err := os.Stat(c.RootFS); err != nil {
+			errs = append(errs, fmt.Errorf("root filesystem not statable: %w", err))
+		}
 	}
 
 	if c.VCPU < 1 {

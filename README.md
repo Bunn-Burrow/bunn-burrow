@@ -28,9 +28,11 @@ bunn-burrow/
 ├── internal/
 │   ├── envcache/         # Prepared environment cache
 │   ├── image/            # OCI image resolution and layer caching
+│   ├── image/cache/      # Content-addressed layer cache
 │   ├── prepare/          # Environment preparation orchestrator
 │   ├── rootfs/           # OCI layer extraction and rootfs building
-│   └── storage/          # Sandbox filesystem isolation
+│   ├── storage/          # Per-VM writable layer management
+│   └── template/         # Immutable VM template metadata and registration
 ├── vmm/                  # Firecracker VM lifecycle management
 ├── main.go               # Host application entry point
 ├── go.mod
@@ -100,6 +102,20 @@ FIRECRACKER_BIN=/home/omkar/.local/bin/firecracker \
 - No permanent CLI or SDK (temporary harnesses only)
 - Guest Agent must be manually injected into OCI rootfs during preparation
 - No guest networking (vsock only for host↔guest communication)
-- No snapshot or pause/resume in production use
 - Each workload execution boots a new Firecracker VM
 - `vmm/sandbox.go` uses a different (incompatible) protocol; use the `exec` command in `main.go` instead
+
+## Milestone 4: Reusable VM Templates & Immutable RootFS
+
+**Status: Implemented**
+
+M4 adds reusable, immutable VM templates:
+
+- **Template management**: `internal/template` — register a prepared rootfs as an immutable template (ID, name, base image, rootfs path/format, architecture, checksum, version), with retrieval, listing, SHA256 integrity validation, and safe deletion (blocked while in use).
+- **Immutable rootfs**: template rootfs is never opened for write after registration, is chmod read-only, is attached read-only if referenced directly, and its checksum is verified on every VM start.
+- **Per-VM writable filesystem**: each VM created from a template (`Config.TemplateID`) boots from an independent atomic copy of the template rootfs, cleaned up on VM destroy. Concurrent creation from one template is safe.
+- **Backward compatible**: direct rootfs creation (`Config.RootFS` without `TemplateID`) is preserved.
+
+See `docs/architecture.md` (M4 section) and `docs/run.md` (M4: Using VM Templates) for details.
+
+**Deferred to M5:** copy-on-write / overlayfs / backing-file storage (M4 uses full per-VM rootfs copies) and a persistent CLI/SDK.
