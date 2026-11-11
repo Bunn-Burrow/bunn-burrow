@@ -634,7 +634,7 @@ func (vm *VM) resolveTemplate(ctx context.Context) error {
 		return fmt.Errorf("layer manager not configured")
 	}
 
-	layerPath, err := vm.LayerMgr.CreateLayer(tmpl.RootfsPath, vm.id)
+	layerPath, err := vm.LayerMgr.CreateLayer(vm.cfg.TemplateID, vm.id)
 	if err != nil {
 		vm.TemplateStore.Release(vm.cfg.TemplateID)
 		return fmt.Errorf("create writable layer: %w", err)
@@ -661,7 +661,7 @@ func (vm *VM) removeWritableLayer() {
 		return
 	}
 	if vm.LayerMgr != nil {
-		_ = vm.LayerMgr.RemoveLayer(layer)
+		_ = vm.LayerMgr.RemoveLayer(vm.id)
 	}
 	if vm.TemplateStore != nil && templateID != "" {
 		vm.TemplateStore.Release(templateID)
