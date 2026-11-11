@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mdlayher/vsock"
@@ -127,6 +128,16 @@ func (s *Server) handleConn(conn net.Conn) {
 			s.handleCancel(conn, req)
 		case "status":
 			s.handleStatus(conn, req)
+		case "prepare_snapshot":
+			s.handlePrepareSnapshot(conn, req)
+		case "sync_filesystems":
+			s.handleSyncFilesystems(conn, req)
+		case "freeze_filesystems":
+			s.handleFreezeFilesystems(conn, req)
+		case "thaw_filesystems":
+			s.handleThawFilesystems(conn, req)
+		case "snapshot_ready":
+			s.handleSnapshotReady(conn, req)
 		default:
 			s.writeError(conn, 400, "unknown kind")
 		}
@@ -445,4 +456,196 @@ func ociEnvSlice(oci *OCIConfig) []string {
 	return oci.Env
 }
 
+// snapshotRequestState tracks snapshot coordination state for a single
+// in-flight request. State is scoped per request_id to avoid cross-VM
+// interference when multiple snapshots coordinate concurrently.
+type snapshotRequestState struct {
+	mu       sync.Mutex
+	frozen   bool
+	prepared bool
+}
+
+// snapshotStates maps request_id to per-request snapshot coordination state.
+// This replaces a single global state so that concurrent snapshot operations
+// for different VMs (or different requests for the same VM) do not interfere.
+var (
+	snapshotStatesMu sync.Mutex
+	snapshotStates   = make(map[string]*snapshotRequestState)
+)
+
+// getSnapshotState returns the per-request state for reqID, creating it if needed.
+func getSnapshotState(reqID string) *snapshotRequestState {
+	snapshotStatesMu.Lock()
+	defer snapshotStatesMu.Unlock()
+	s, ok := snapshotStates[reqID]
+	if !ok {
+		s = &snapshotRequestState{}
+		snapshotStates[reqID] = s
+	}
+	return s
+}
+
+// deleteSnapshotState removes the per-request state for reqID once the
+// coordination is complete (success or failure).
+func deleteSnapshotState(reqID string) {
+	snapshotStatesMu.Lock()
+	defer snapshotStatesMu.Unlock()
+	delete(snapshotStates, reqID)
+}
+
+// handlePrepareSnapshot prepares the guest for snapshot: sync filesystem state.
+func (s *Server) handlePrepareSnapshot(conn net.Conn, req map[string]any) {
+	reqID, _ := req["request_id"].(string)
+	if reqID == "" {
+		s.writeError(conn, 400, "request_id is required")
+		return
+	}
+
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	if state.frozen {
+		state.mu.Unlock()
+		s.writeError(conn, 409, "guest filesystems already frozen")
+		return
+	}
+	state.prepared = true
+	state.mu.Unlock()
+
+	resp := map[string]any{
+		"kind":       "snapshot_prepared",
+		"request_id": reqID,
+		"status":     "ok",
+		"message":    "guest prepared for snapshot",
+	}
+	s.writeJSON(conn, resp)
+}
+
+// handleSyncFilesystems flushes pending filesystem writes via sync(2).
+func (s *Server) handleSyncFilesystems(conn net.Conn, req map[string]any) {
+	reqID, _ := req["request_id"].(string)
+	if reqID == "" {
+		s.writeError(conn, 400, "request_id is required")
+		return
+	}
+
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	if !state.prepared {
+		state.mu.Unlock()
+		s.writeError(conn, 409, "guest not prepared for snapshot")
+		return
+	}
+	state.mu.Unlock()
+
+	// Sync all filesystems.
+	syscall.Sync()
+
+	resp := map[string]any{
+		"kind":       "filesystems_synced",
+		"request_id": reqID,
+		"status":     "ok",
+		"message":    "filesystem writes flushed",
+	}
+	s.writeJSON(conn, resp)
+}
+
+// handleFreezeFilesystems freezes supported filesystems for snapshot.
+func (s *Server) handleFreezeFilesystems(conn net.Conn, req map[string]any) {
+	reqID, _ := req["request_id"].(string)
+	if reqID == "" {
+		s.writeError(conn, 400, "request_id is required")
+		return
+	}
+
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	if state.frozen {
+		state.mu.Unlock()
+		s.writeError(conn, 409, "guest filesystems already frozen")
+		return
+	}
+	if !state.prepared {
+		state.mu.Unlock()
+		s.writeError(conn, 409, "guest not prepared for snapshot")
+		return
+	}
+
+	// Sync all filesystems before freeze.
+	syscall.Sync()
+
+	state.frozen = true
+	state.mu.Unlock()
+
+	resp := map[string]any{
+		"kind":       "filesystems_frozen",
+		"request_id": reqID,
+		"status":     "ok",
+		"message":    "guest filesystems frozen for snapshot",
+	}
+	s.writeJSON(conn, resp)
+}
+
+// handleThawFilesystems thaws previously frozen filesystems.
+func (s *Server) handleThawFilesystems(conn net.Conn, req map[string]any) {
+	reqID, _ := req["request_id"].(string)
+	if reqID == "" {
+		s.writeError(conn, 400, "request_id is required")
+		return
+	}
+
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	if !state.frozen {
+		state.mu.Unlock()
+		s.writeError(conn, 409, "guest filesystems not frozen")
+		return
+	}
+	state.frozen = false
+	state.prepared = false
+	state.mu.Unlock()
+	deleteSnapshotState(reqID)
+
+	resp := map[string]any{
+		"kind":       "filesystems_thawed",
+		"request_id": reqID,
+		"status":     "ok",
+		"message":    "guest filesystems thawed",
+	}
+	s.writeJSON(conn, resp)
+}
+
+// handleSnapshotReady acknowledges that the Firecracker snapshot has been
+// captured and the guest can resume normal operations.
+func (s *Server) handleSnapshotReady(conn net.Conn, req map[string]any) {
+	reqID, _ := req["request_id"].(string)
+	if reqID == "" {
+		s.writeError(conn, 400, "request_id is required")
+		return
+	}
+
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	if !state.frozen {
+		state.mu.Unlock()
+		s.writeError(conn, 409, "guest filesystems not frozen")
+		return
+	}
+	state.frozen = false
+	state.prepared = false
+	state.mu.Unlock()
+	deleteSnapshotState(reqID)
+
+	resp := map[string]any{
+		"kind":       "snapshot_ready",
+		"request_id": reqID,
+		"status":     "ok",
+		"message":    "guest acknowledged snapshot ready",
+	}
+	s.writeJSON(conn, resp)
+}
+
+// Protocol version for the snapshot coordination extension.
+const snapshotProtocolVersion = float64(2)
+
 var _ = strings.TrimSpace
+var _ = syscall.Sync

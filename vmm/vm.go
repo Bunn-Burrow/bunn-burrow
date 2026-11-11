@@ -47,6 +47,9 @@ type VM struct {
 	// Optional; when nil, template-based VM creation passes the qcow2 path
 	// directly (not supported by Firecracker natively).
 	NBDMgr *storage.NBDManager
+	// StorageManager tracks persistent storage resources for this VM.
+	// Optional; when nil, storage lifecycle tracking is disabled.
+	StorageManager *storage.StorageManager
 
 	// writableLayer is the path to this VM's writable layer copy when booted
 	// from a template. It is cleared once the layer is released.
@@ -187,12 +190,16 @@ func (vm *VM) Start(ctx context.Context) error {
 		return fmt.Errorf("start instance: %w", err)
 	}
 
+	vm.logger.Info("guest instance started",
+		map[string]any{"vm_id": vm.id, "vcpu": vm.cfg.VCPU, "mem_mib": vm.cfg.MemSizeMiB})
+
 	if err := vm.sm.Transition(StatePreparing, StateRunning); err != nil {
 		vm.stopProcLocked()
 		return fmt.Errorf("finalize start: %w", err)
 	}
 
-	vm.logger.Info("VM started")
+	vm.logger.Info("VM started",
+		map[string]any{"vm_id": vm.id, "pid": vm.proc.PID(), "state": vm.State()})
 	return nil
 }
 
@@ -449,62 +456,79 @@ func (vm *VM) Stop(ctx context.Context) error {
 		ActionType: instanceActionPtr(models.InstanceActionInfoActionTypeSendCtrlAltDel),
 	})
 
+	// Wait for graceful shutdown.
+	terminated := false
 	select {
 	case <-vm.exitCh:
-		goto terminated
+		terminated = true
 	case <-time.After(vm.cfg.StopTimeout):
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
-	if proc := vm.process(); proc != nil {
-		_ = proc.Signal(syscall.SIGTERM)
-	}
-	select {
-	case <-vm.exitCh:
-		goto terminated
-	case <-time.After(vm.cfg.StopGraceTimeout):
+	if !terminated {
+		// Escalate: send SIGTERM.
+		if proc := vm.process(); proc != nil {
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+		select {
+		case <-vm.exitCh:
+			terminated = true
+		case <-time.After(vm.cfg.StopGraceTimeout):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
-	if proc := vm.process(); proc != nil {
-		_ = proc.Kill()
+	if !terminated {
+		// Escalate: send SIGKILL.
+		if proc := vm.process(); proc != nil {
+			_ = proc.Kill()
+		}
+		// Wait longer after SIGKILL; the process should exit quickly but may need
+		// time to be reaped by the kernel.
+		select {
+		case <-vm.exitCh:
+			terminated = true
+		case <-time.After(vm.cfg.StopGraceTimeout):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	select {
-	case <-vm.exitCh:
-		goto terminated
-	case <-time.After(vm.cfg.StopGraceTimeout):
-		proc := vm.process()
 
-		fields := logrus.Fields{
-			"state": vm.State(),
+	if terminated {
+		vm.mu.Lock()
+		if vm.proc != nil {
+			vm.exitErr = vm.proc.ExitError()
+		}
+		vm.mu.Unlock()
+
+		if err := vm.releaseRuntime(); err != nil {
+			vm.logger.WithError(err).Warn("runtime release during stop")
 		}
 
-		if proc != nil {
-			fields["pid"] = proc.PID()
-			fields["reaped"] = proc.Reaped()
-			fields["exitErr"] = proc.ExitError()
+		if err := vm.sm.Transition(StateStopping, StateStopped); err != nil {
+			return fmt.Errorf("finalize stop: %w", err)
 		}
 
-		vm.logger.WithFields(fields).Error(
-			"Firecracker termination wait timed out",
-		)
-
-		return fmt.Errorf("stop: firecracker did not terminate after escalation")
+		vm.logger.Info("VM stopped")
+		return nil
 	}
 
-terminated:
-	vm.mu.Lock()
-	vm.exitErr = vm.proc.ExitError()
-	vm.mu.Unlock()
-
-	if err := vm.releaseRuntime(); err != nil {
-		vm.logger.WithError(err).Warn("runtime release during stop")
+	// If we reach here, SIGKILL was sent but the process has not been reaped.
+	// It may be a zombie or stuck in uninterruptible sleep. Report failure
+	// without claiming the VM is stopped.
+	proc := vm.process()
+	fields := logrus.Fields{
+		"state": vm.State(),
 	}
-
-	if err := vm.sm.Transition(StateStopping, StateStopped); err != nil {
-		return fmt.Errorf("finalize stop: %w", err)
+	if proc != nil {
+		fields["pid"] = proc.PID()
+		fields["reaped"] = proc.Reaped()
+		fields["exitErr"] = proc.ExitError()
 	}
-
-	vm.logger.Info("VM stopped")
-	return nil
+	vm.logger.WithFields(fields).Error("Firecracker did not terminate after SIGKILL escalation")
+	return fmt.Errorf("stop: firecracker did not terminate after escalation")
 }
 
 // Destroy ensures the VM cannot keep running, closes sockets, and removes
@@ -655,7 +679,7 @@ func (vm *VM) resolveTemplate(ctx context.Context) error {
 	// Map the qcow2 overlay to an NBD block device. Firecracker does not
 	// understand qcow2 natively; the NBD device exposes the overlay as a raw
 	// block device via qemu-nbd.
-	nbdDevice, err := vm.NBDMgr.Map(layerPath, vm.id)
+	nbdDevice, err := vm.NBDMgr.Map(ctx, layerPath, vm.id)
 	if err != nil {
 		vm.TemplateStore.Release(vm.cfg.TemplateID)
 		_ = vm.LayerMgr.RemoveLayer(vm.id)
@@ -668,12 +692,27 @@ func (vm *VM) resolveTemplate(ctx context.Context) error {
 	vm.cfg.RootFS = nbdDevice
 	vm.mu.Unlock()
 
+	vm.logger.Info("template resolved",
+		map[string]any{"template_id": vm.cfg.TemplateID, "layer_path": layerPath, "nbd_device": nbdDevice})
+
+	// Register the VM and its overlay with the storage manager for lifecycle
+	// tracking and crash recovery.
+	if vm.StorageManager != nil {
+		if err := vm.StorageManager.RegisterVM(vm.id, vm.cfg.TemplateID, layerPath, nbdDevice); err != nil {
+			// Roll back: ReleaseVM cleans up any partially registered resources
+			// (VM resource, overlay resource, backing ref, template ref).
+			_ = vm.StorageManager.ReleaseVM(vm.id)
+			_ = vm.NBDMgr.Unmap(vm.id)
+			return fmt.Errorf("register VM storage: %w", err)
+		}
+	}
+
 	return nil
 }
 
-// removeWritableLayer releases this VM's writable layer, NBD mapping, and the
-// template reference it holds. It is idempotent and safe to call after partial
-// creation.
+// removeWritableLayer releases this VM's writable layer, NBD mapping, and
+// coordinates with the StorageManager to release template references and
+// overlay metadata. It is idempotent and safe to call after partial creation.
 func (vm *VM) removeWritableLayer() {
 	vm.mu.Lock()
 	layer := vm.writableLayer
@@ -686,14 +725,34 @@ func (vm *VM) removeWritableLayer() {
 	if layer == "" && nbdDevice == "" {
 		return
 	}
+
+	vm.logger.Info("releasing VM writable layer",
+		map[string]any{"vm_id": vm.id, "layer_path": layer, "nbd_device": nbdDevice, "template_id": templateID})
+
+	// Unmap the NBD device (stops qemu-nbd) if one was mapped.
 	if vm.NBDMgr != nil && nbdDevice != "" {
 		_ = vm.NBDMgr.Unmap(vm.id)
 	}
+
+	if vm.StorageManager != nil {
+		// The StorageManager owns overlay metadata, backing-image references,
+		// and template references. ReleaseVM handles all of them atomically.
+		_ = vm.StorageManager.ReleaseVM(vm.id)
+		// Remove the layer file itself (metadata is deleted by ReleaseVM).
+		if layer != "" {
+			_ = os.Remove(layer)
+		}
+		return
+	}
+
+	// Backward-compatible path: no StorageManager. Remove layer metadata and
+	// file, and release the template reference directly.
 	if vm.LayerMgr != nil && layer != "" {
 		_ = vm.LayerMgr.RemoveLayer(vm.id)
 	}
-	if vm.TemplateStore != nil && templateID != "" {
-		vm.TemplateStore.Release(templateID)
+	if vm.TemplateStore != nil {
+		// The template ID is still in cfg.TemplateID at this point.
+		vm.TemplateStore.Release(vm.cfg.TemplateID)
 	}
 }
 

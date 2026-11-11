@@ -107,21 +107,27 @@ FIRECRACKER_BIN=/home/omkar/.local/bin/firecracker \
 - Each workload execution boots a new Firecracker VM
 - `vmm/sandbox.go` uses a different (incompatible) protocol; use the `exec` command in `main.go` instead
 
-## Milestone 4, 5 & 6: Templates, COW Storage & Snapshot/Restore
+## Milestone 4, 5, 6, 7 & 8: Templates, COW Storage, Snapshot/Restore, Lifecycle Management & Runtime Reliability
 
 **Status: Implemented**
 
 M4 adds reusable, immutable VM templates. M5 replaces the full per-VM rootfs
 copy with a copy-on-write storage engine using qcow2 backing images and
-per-VM writable overlays. M6 adds Firecracker VM snapshot and restore.
+per-VM writable overlays. M6 adds Firecracker VM snapshot and restore. M7 adds
+persistent storage lifecycle management and crash recovery. M8 adds runtime
+reliability, crash-consistent snapshots with guest coordination protocol, and
+enhanced crash recovery.
 
 - **Template management**: `internal/template` — register a prepared rootfs as an immutable template (ID, name, base image, rootfs path/format, architecture, checksum, version), with retrieval, listing, SHA256 integrity validation, and safe deletion (blocked while in use).
 - **Immutable rootfs**: template rootfs and backing image are never opened for write after creation, are chmod read-only, and the rootfs checksum is verified on every VM start.
 - **Copy-on-write storage** (M5): `internal/storage` — one immutable qcow2 backing image per template; one VM-private writable qcow2 overlay per VM; `qemu-img` required. Overlays exposed to Firecracker via NBD (`qemu-nbd`) since Firecracker does not understand qcow2 natively.
 - **Per-VM writable filesystem**: each VM created from a template (`Config.TemplateID`) boots from an independent qcow2 overlay via a unique NBD device, cleaned up on VM destroy. Concurrent creation from one template is safe.
 - **Snapshot & restore** (M6): `vmm/snapshot.go` — crash-consistent snapshots from paused VMs via Firecracker `CreateSnapshot`/`LoadSnapshot`; self-contained overlay copies for snapshot independence; durable `SnapshotStore` with atomic metadata; `RestoreSnapshot` creates independent VMs with unique host-side resources.
+- **Storage lifecycle & crash recovery** (M7): `internal/storage/manager.go`, `internal/storage/metadata.go`, `internal/storage/nbd.go` — persistent storage metadata with reference counting, `Recover` for post-crash reconciliation, `CollectGarbage` (dry-run/exec) for orphan cleanup, `ReconcileNBD` for stale NBD mapping detection, `DeleteSnapshot` for safe snapshot removal.
+- **Runtime reliability** (M8): `vmm/snapshot_coordinator.go` — `SnapshotCoordinator` with `crash_consistent` mode; Guest Agent snapshot coordination protocol (v2) with `prepare_snapshot`, `sync_filesystems`, `freeze_filesystems`, `thaw_filesystems`, `snapshot_ready` handlers; context-aware NBD `Map`/`UnmapContext`; process identity verification; improved `Stop()` escalation; structured lifecycle logging; enhanced `Recover()` with interrupted operation detection.
+  - **Consistency guarantees**: `crash_consistent` (VM paused at snapshot time; disk writes captured as they exist in host page cache). `filesystem_consistent` is deferred — `sync()` alone does not provide filesystem freezing, and guest-side FIFREEZE support cannot be safely guaranteed across all guest images.
 - **Backward compatible**: direct rootfs creation (`Config.RootFS` without `TemplateID`) is preserved. Legacy `Fork`/`restoreVM` API preserved.
 
-See `docs/architecture.md` (M5/M6 sections) and `docs/run.md` (M5/M6 usage) for details.
+See `docs/architecture.md` (M5/M6/M7/M8 sections) and `docs/run.md` (M5/M6/M7/M8 usage) for details.
 
-**Deferred to M7:** overlay garbage collection for layers orphaned by crashed VMs, application-consistent snapshots (guest fsync coordination), a persistent CLI/SDK.
+**Deferred to M9:** automatic VM resumption after crash, `filesystem_consistent` snapshots with safe guest freeze/thaw, application-consistent snapshots, a persistent CLI/SDK, runtime metrics collection.

@@ -81,6 +81,14 @@ type SnapshotInfo struct {
 	VsockPort   uint32 `json:"vsock_port"`
 	KernelImage string `json:"kernel_image"`
 	BootArgs    string `json:"boot_args"`
+
+	// ConsistencyMode is the snapshot consistency guarantee level
+	// ("crash_consistent" or "filesystem_consistent").
+	ConsistencyMode string `json:"consistency_mode"`
+
+	// RequestID is the coordination request ID used for guest snapshot
+	// coordination (empty for crash_consistent snapshots).
+	RequestID string `json:"request_id"`
 }
 
 const (
@@ -769,7 +777,7 @@ func RestoreSnapshot(ctx context.Context, store *SnapshotStore, snapID string,
 		if nm == nil {
 			return nil, fmt.Errorf("snapshot %q requires template-based restore but no NBD manager configured", snapID)
 		}
-		nbdDevice, err := nm.Map(snap.OverlayPath, vm.id)
+		nbdDevice, err := nm.Map(ctx, snap.OverlayPath, vm.id)
 		if err != nil {
 			_ = vm.destroy(ctx, true)
 			return nil, fmt.Errorf("map snapshot overlay to NBD: %w", err)
@@ -855,4 +863,52 @@ func writeJSONAtomically(tmpPath, finalPath string, v any) error {
 		return err
 	}
 	return os.Rename(tmpPath, finalPath)
+}
+
+// snapshotStoreAdapter adapts *SnapshotStore to the storage.SnapshotStore
+// interface so the storage package can manage snapshot references without
+// importing vmm.
+type snapshotStoreAdapter struct {
+	store *SnapshotStore
+}
+
+// Get returns the snapshot reference for id, or ok=false if not found.
+func (a *snapshotStoreAdapter) Get(id string) (*storage.SnapshotRef, bool) {
+	s := a.store.Get(id)
+	if s == nil {
+		return nil, false
+	}
+	return &storage.SnapshotRef{
+		ID:          s.ID,
+		Status:      s.Status,
+		OverlayPath: s.OverlayPath,
+	}, true
+}
+
+// List returns references for all known snapshots.
+func (a *snapshotStoreAdapter) List() ([]*storage.SnapshotRef, error) {
+	snaps, err := a.store.List()
+	if err != nil {
+		return nil, err
+	}
+	var refs []*storage.SnapshotRef
+	for _, s := range snaps {
+		refs = append(refs, &storage.SnapshotRef{
+			ID:          s.ID,
+			Status:      s.Status,
+			OverlayPath: s.OverlayPath,
+		})
+	}
+	return refs, nil
+}
+
+// Delete removes a snapshot's metadata and artifacts.
+func (a *snapshotStoreAdapter) Delete(id string) error {
+	return a.store.Delete(id)
+}
+
+// StorageSnapshotStore returns a storage.SnapshotStore adapter wrapping this
+// SnapshotStore.
+func (s *SnapshotStore) StorageSnapshotStore() storage.SnapshotStore {
+	return &snapshotStoreAdapter{store: s}
 }
