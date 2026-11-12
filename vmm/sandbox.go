@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/omkar/sandbox/internal/storage"
 )
 
 // MaxStdinSize is the maximum size of stdin data that can be sent with an
@@ -368,9 +370,9 @@ func (s *Sandbox) UploadProject(ctx context.Context, p *Project) error {
 
 	// Send upload_project control message.
 	req := map[string]any{
-		"kind":           "upload_project",
-		"project_id":     p.ID,
-		"workspace_dir":  workspaceDir,
+		"kind":          "upload_project",
+		"project_id":    p.ID,
+		"workspace_dir": workspaceDir,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -506,10 +508,10 @@ func (s *Sandbox) DownloadFile(ctx context.Context, projectID, path string, w io
 
 	// Send download_file control message.
 	req := map[string]any{
-		"kind":           "download_file",
-		"project_id":     projectID,
-		"path":           path,
-		"workspace_dir":  workspaceDir,
+		"kind":          "download_file",
+		"project_id":    projectID,
+		"path":          path,
+		"workspace_dir": workspaceDir,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -600,6 +602,118 @@ func (s *Sandbox) DownloadFile(ctx context.Context, projectID, path string, w io
 	}
 }
 
+// Volume management API for persistent volumes.
+
+// CreateVolume creates a new persistent volume with the given ID and size.
+// If sizeBytes is 0, the configured default size is used. The volume survives
+// VM destruction and can be reattached to another VM.
+func (s *Sandbox) CreateVolume(ctx context.Context, volumeID string, sizeBytes int64, metadata, labels map[string]string) (*storage.Volume, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return nil, errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.CreateVolume(volumeID, sizeBytes, metadata, labels)
+}
+
+// InspectVolume returns the volume with the given ID, or nil if not found.
+func (s *Sandbox) InspectVolume(volumeID string) (*storage.Volume, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return nil, errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.InspectVolume(volumeID)
+}
+
+// ListVolumes returns all known volumes.
+func (s *Sandbox) ListVolumes() ([]*storage.Volume, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return nil, errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.ListVolumes()
+}
+
+// DeleteVolume deletes a volume. It fails if the volume is currently attached
+// to a VM.
+func (s *Sandbox) DeleteVolume(volumeID string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.DeleteVolume(volumeID)
+}
+
+// AttachVolume attaches a volume to this sandbox's VM. Returns the NBD device
+// path exposed to the guest.
+func (s *Sandbox) AttachVolume(ctx context.Context, volumeID string) (string, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return "", errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return "", errors.New("volume manager not configured")
+	}
+
+	if vm.State() != StateRunning {
+		return "", fmt.Errorf("sandbox VM not running (state=%s)", vm.State())
+	}
+
+	return vm.VolumeManager.AttachVolume(ctx, volumeID, vm.id)
+}
+
+// DetachVolume detaches a volume from this sandbox's VM.
+func (s *Sandbox) DetachVolume(volumeID string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.DetachVolume(volumeID)
+}
+
 // SessionConfig describes the configuration for starting an interactive PTY session.
 type SessionConfig struct {
 	// Cmd is the executable to run inside the guest.
@@ -628,13 +742,13 @@ type SessionConfig struct {
 // It is safe for concurrent use: SendInput and ReceiveOutput can be called
 // from different goroutines.
 type Session struct {
-	mu       sync.Mutex
-	conn     io.ReadWriteCloser
+	mu        sync.Mutex
+	conn      io.ReadWriteCloser
 	sessionID string
-	sandbox  *Sandbox
-	done     chan struct{}
-	outputCh chan []byte
-	errCh    chan error
+	sandbox   *Sandbox
+	done      chan struct{}
+	outputCh  chan []byte
+	errCh     chan error
 }
 
 // StartSession starts an interactive PTY session inside the sandboxed guest.
@@ -665,14 +779,14 @@ func (s *Sandbox) StartSession(ctx context.Context, cfg SessionConfig) (*Session
 
 	// Send session_start request.
 	req := map[string]any{
-		"kind":           "session_start",
-		"session_id":     sessionID,
-		"command":        cfg.Cmd,
-		"args":           cfg.Args,
-		"env":            cfg.Env,
-		"working_dir":    cfg.Dir,
-		"rows":           cfg.Rows,
-		"cols":           cfg.Cols,
+		"kind":            "session_start",
+		"session_id":      sessionID,
+		"command":         cfg.Cmd,
+		"args":            cfg.Args,
+		"env":             cfg.Env,
+		"working_dir":     cfg.Dir,
+		"rows":            cfg.Rows,
+		"cols":            cfg.Cols,
 		"timeout_seconds": cfg.Timeout.Seconds(),
 	}
 	payload, err := json.Marshal(req)
@@ -750,12 +864,12 @@ func (s *Sandbox) StartSession(ctx context.Context, cfg SessionConfig) (*Session
 		}
 		// Connection is now dedicated to this session. Start the output reader.
 		sess := &Session{
-			conn:       conn,
-			sessionID:  sessionID,
-			sandbox:    s,
-			done:       make(chan struct{}),
-			outputCh:   make(chan []byte, 128),
-			errCh:      make(chan error, 1),
+			conn:      conn,
+			sessionID: sessionID,
+			sandbox:   s,
+			done:      make(chan struct{}),
+			outputCh:  make(chan []byte, 128),
+			errCh:     make(chan error, 1),
 		}
 		go sess.readLoop(msgCh)
 		return sess, nil
@@ -811,9 +925,9 @@ func (sess *Session) SendInput(data []byte) error {
 	}
 
 	req := map[string]any{
-		"kind":         "session_input",
-		"session_id":   sess.sessionID,
-		"data":         string(data),
+		"kind":       "session_input",
+		"session_id": sess.sessionID,
+		"data":       string(data),
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -909,8 +1023,8 @@ func (sess *Session) Status(ctx context.Context) (map[string]any, error) {
 	defer conn.Close()
 
 	req := map[string]any{
-		"kind":         "session_status",
-		"session_id":   sessionID,
+		"kind":       "session_status",
+		"session_id": sessionID,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -997,8 +1111,8 @@ func (sess *Session) Terminate(ctx context.Context) error {
 	sess.mu.Unlock()
 
 	req := map[string]any{
-		"kind":         "session_terminate",
-		"session_id":   sess.sessionID,
+		"kind":       "session_terminate",
+		"session_id": sess.sessionID,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -1037,8 +1151,8 @@ func (sess *Session) Detach(ctx context.Context) error {
 	sess.mu.Unlock()
 
 	req := map[string]any{
-		"kind":         "session_detach",
-		"session_id":   sess.sessionID,
+		"kind":       "session_detach",
+		"session_id": sess.sessionID,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {

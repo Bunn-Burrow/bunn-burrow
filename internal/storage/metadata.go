@@ -18,6 +18,7 @@ const (
 	ResourceTypeOverlay  ResourceType = "overlay"
 	ResourceTypeSnapshot ResourceType = "snapshot"
 	ResourceTypeVM       ResourceType = "vm"
+	ResourceTypeVolume   ResourceType = "volume"
 )
 
 // LifecycleState describes the lifecycle state of a storage resource.
@@ -76,6 +77,15 @@ type StorageResource struct {
 
 	// ReferenceCount is the number of active owners of this resource.
 	ReferenceCount int `json:"reference_count"`
+
+	// SizeBytes is the resource capacity in bytes, if applicable (volumes).
+	SizeBytes int64 `json:"size_bytes,omitempty"`
+
+	// Labels are optional user-defined key-value labels.
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// Metadata is optional user-defined key-value metadata.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // resourceMetadataDir holds persistent storage resource metadata files.
