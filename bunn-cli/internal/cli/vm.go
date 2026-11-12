@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -96,6 +97,24 @@ func buildVMMConfigFromViper(v *config.Loader, vmID string) (vmm.Config, error) 
 	vmmCfg.StopTimeout = v.Viper().GetDuration(config.KeyRuntimeStopTimeout)
 	vmmCfg.StopGraceTimeout = 5 * time.Second
 
+	// Network configuration.
+	if v.Viper().GetBool(config.KeyNetworkEnabled) {
+		gwStr := v.Viper().GetString(config.KeyNetworkGateway)
+		var gw net.IP
+		if gwStr != "" {
+			gw = net.ParseIP(gwStr)
+		}
+		vmmCfg.Network = &vmm.NetworkConfig{
+			Enabled:       true,
+			Bridge:        v.Viper().GetString(config.KeyNetworkBridge),
+			CIDR:          v.Viper().GetString(config.KeyNetworkCIDR),
+			Gateway:       gw,
+			NATInterface:  v.Viper().GetString(config.KeyNetworkNATInterface),
+			Firewall:      v.Viper().GetBool(config.KeyNetworkFirewall),
+			MTU:           v.Viper().GetInt(config.KeyNetworkMTU),
+		}
+	}
+
 	return vmmCfg, nil
 }
 
@@ -133,6 +152,14 @@ func newVMRunCommand(loader *config.Loader) *cobra.Command {
 		port     uint32
 		bin      string
 		template string
+
+		networkEnabled  bool
+		networkBridge   string
+		networkCIDR     string
+		networkGateway  string
+		networkNATIface string
+		networkFirewall bool
+		networkMTU      int
 	)
 
 	cmd := &cobra.Command{
@@ -163,6 +190,13 @@ is lost. It cannot be managed by a later ` + "`bunn`" + ` invocation.`,
 			loader.BindPFlag(config.KeyRuntimeRootFSPath, cmd.Flags().Lookup("rootfs"))
 			loader.BindPFlag(config.KeyRuntimeWorkDir, cmd.Flags().Lookup("workdir"))
 			loader.BindPFlag(config.KeyRuntimeFirecrackerBin, cmd.Flags().Lookup("bin"))
+			loader.BindPFlag(config.KeyNetworkEnabled, cmd.Flags().Lookup("network"))
+			loader.BindPFlag(config.KeyNetworkBridge, cmd.Flags().Lookup("network-bridge"))
+			loader.BindPFlag(config.KeyNetworkCIDR, cmd.Flags().Lookup("network-cidr"))
+			loader.BindPFlag(config.KeyNetworkGateway, cmd.Flags().Lookup("network-gateway"))
+			loader.BindPFlag(config.KeyNetworkNATInterface, cmd.Flags().Lookup("network-nat-iface"))
+			loader.BindPFlag(config.KeyNetworkFirewall, cmd.Flags().Lookup("network-firewall"))
+			loader.BindPFlag(config.KeyNetworkMTU, cmd.Flags().Lookup("network-mtu"))
 
 			if _, err := loader.Load(""); err != nil {
 				return err
@@ -268,6 +302,13 @@ is lost. It cannot be managed by a later ` + "`bunn`" + ` invocation.`,
 	cmd.Flags().StringVar(&bin, "bin", "", "Firecracker binary path")
 	cmd.Flags().StringVar(&template, "template", "", "Template ID (uses template rootfs instead of --rootfs)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output in JSON format")
+	cmd.Flags().BoolVar(&networkEnabled, "network", false, "Enable VM networking (TAP + bridge + NAT)")
+	cmd.Flags().StringVar(&networkBridge, "network-bridge", "", "Bridge name for VM TAPs")
+	cmd.Flags().StringVar(&networkCIDR, "network-cidr", "", "CIDR pool for VM IP allocation")
+	cmd.Flags().StringVar(&networkGateway, "network-gateway", "", "Gateway IP for VM subnet")
+	cmd.Flags().StringVar(&networkNATIface, "network-nat-iface", "", "Host interface for outbound masquerade")
+	cmd.Flags().BoolVar(&networkFirewall, "network-firewall", true, "Enable nftables firewall for VM isolation")
+	cmd.Flags().IntVar(&networkMTU, "network-mtu", 1500, "MTU for TAP devices")
 	return cmd
 }
 

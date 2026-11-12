@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/omkar/sandbox/internal/network"
 	"github.com/omkar/sandbox/internal/storage"
 	"github.com/omkar/sandbox/internal/template"
 )
@@ -50,6 +51,15 @@ type VM struct {
 	// StorageManager tracks persistent storage resources for this VM.
 	// Optional; when nil, storage lifecycle tracking is disabled.
 	StorageManager *storage.StorageManager
+	// NetworkManager manages TAP/IPAM/firewall resources for VMs. Optional;
+	// when nil and Network is set, the VM creates its own manager and owns it.
+	NetworkManager *network.Manager
+
+	// network is the allocated network for this VM, if networking is enabled.
+	network *network.Network
+	// ownNetworkMgr indicates whether this VM owns its NetworkManager and
+	// should shut it down on Destroy.
+	ownNetworkMgr bool
 
 	// writableLayer is the path to this VM's writable layer copy when booted
 	// from a template. It is cleared once the layer is released.
@@ -85,6 +95,17 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 		sm:     NewStateMachine(),
 		exitCh: make(chan struct{}),
 		logger: logger.WithField("vm", id),
+	}
+
+	// If networking is configured but no shared network manager is provided,
+	// create one owned by this VM.
+	if cfg.Network != nil && cfg.Network.Enabled && vm.NetworkManager == nil {
+		mgr, err := network.NewManager(cfg.Network.toInternal(), logger)
+		if err != nil {
+			return nil, fmt.Errorf("create network manager: %w", err)
+		}
+		vm.NetworkManager = mgr
+		vm.ownNetworkMgr = true
 	}
 
 	// Create the VM's private working directory so Firecracker can place its
@@ -150,9 +171,17 @@ func (vm *VM) Start(ctx context.Context) error {
 	// starts. If a layer is created but startup later fails, it is cleaned up by
 	// the deferred removal below.
 	var layerCreated bool
+	// networkAllocated tracks whether network resources were allocated so they
+	// can be released on failure.
+	var networkAllocated bool
 	defer func() {
 		if layerCreated && vm.State() != StateRunning {
 			vm.removeWritableLayer()
+		}
+		if networkAllocated && vm.State() != StateRunning {
+			if err := vm.releaseNetwork(); err != nil {
+				vm.logger.WithError(err).Warn("release network on startup failure")
+			}
 		}
 	}()
 
@@ -168,6 +197,15 @@ func (vm *VM) Start(ctx context.Context) error {
 		vm.sm.TransitionTo(StateFailed)
 		return err
 	}
+
+	// Allocate network resources (TAP, IP, bridge port, firewall rules) before
+	// device configuration so the TAP path is available to Firecracker.
+	if err := vm.allocateNetwork(ctx); err != nil {
+		vm.stopProcLocked()
+		vm.sm.TransitionTo(StateFailed)
+		return fmt.Errorf("allocate network: %w", err)
+	}
+	networkAllocated = true
 
 	if err := vm.configureDevices(ctx); err != nil {
 		vm.stopProcLocked()
@@ -289,6 +327,19 @@ func (vm *VM) configureDevices(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+
+	// Attach the network interface if networking is configured. Firecracker
+	// expects the host to create the TAP device before this call.
+	if n := vm.network; n != nil {
+		if err := vm.api.PutGuestNetworkInterfaceByID(ctx, n.IfaceID, &models.NetworkInterface{
+			GuestMac:   n.MAC.String(),
+			HostDevName: &n.TapDevice,
+			IfaceID:    &n.IfaceID,
+		}); err != nil {
+			return fmt.Errorf("configure network interface: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -309,6 +360,60 @@ func (vm *VM) configureVsock(ctx context.Context) error {
 	vm.transport = NewTransport(vm.res.VsockSock, vm.cfg.VsockCID)
 	vm.mu.Unlock()
 	return nil
+}
+
+// allocateNetwork initializes the shared network manager (if not already
+// initialized) and allocates network resources for this VM. It binds
+// vm.network which is later used by configureDevices to attach the TAP to
+// Firecracker.
+func (vm *VM) allocateNetwork(ctx context.Context) error {
+	if vm.cfg.Network == nil || !vm.cfg.Network.Enabled {
+		return nil
+	}
+
+	mgr := vm.NetworkManager
+	if mgr == nil {
+		return fmt.Errorf("network manager not configured")
+	}
+
+	if err := mgr.Initialize(); err != nil {
+		return fmt.Errorf("initialize network manager: %w", err)
+	}
+
+	n, err := mgr.Allocate(vm.id)
+	if err != nil {
+		return err
+	}
+	vm.network = n
+	return nil
+}
+
+// releaseNetwork releases this VM's network resources. It is safe to call
+// multiple times.
+func (vm *VM) releaseNetwork() error {
+	vm.mu.Lock()
+	n := vm.network
+	vm.network = nil
+	vm.mu.Unlock()
+
+	if n == nil {
+		return nil
+	}
+
+	mgr := vm.NetworkManager
+	if mgr == nil {
+		return nil
+	}
+	return mgr.Release(vm.id)
+}
+
+// shutDownNetworkMgr shuts down an owned network manager, releasing shared
+// resources (bridge, firewall rules).
+func (vm *VM) shutDownNetworkMgr() error {
+	if !vm.ownNetworkMgr || vm.NetworkManager == nil {
+		return nil
+	}
+	return vm.NetworkManager.Shutdown()
 }
 
 // waitForSocket waits for the Firecracker API socket to accept requests, bounded
@@ -507,6 +612,10 @@ func (vm *VM) Stop(ctx context.Context) error {
 			vm.logger.WithError(err).Warn("runtime release during stop")
 		}
 
+		if err := vm.releaseNetwork(); err != nil {
+			vm.logger.WithError(err).Warn("network release during stop")
+		}
+
 		if err := vm.sm.Transition(StateStopping, StateStopped); err != nil {
 			return fmt.Errorf("finalize stop: %w", err)
 		}
@@ -573,11 +682,18 @@ func (vm *VM) Destroy(ctx context.Context) error {
 	if err := vm.releaseRuntime(); err != nil {
 		errs = append(errs, fmt.Errorf("release runtime: %w", err))
 	}
+	if err := vm.releaseNetwork(); err != nil {
+		errs = append(errs, fmt.Errorf("release network: %w", err))
+	}
 	if err := vm.removeOwnedArtifacts(); err != nil {
 		errs = append(errs, fmt.Errorf("remove artifacts: %w", err))
 	}
 
 	vm.removeWritableLayer()
+
+	if err := vm.shutDownNetworkMgr(); err != nil {
+		errs = append(errs, fmt.Errorf("shutdown network manager: %w", err))
+	}
 
 	vm.mu.Lock()
 	vm.api = nil
@@ -806,6 +922,7 @@ func (vm *VM) destroy(ctx context.Context, force bool) error {
 
 func int64Ptr(v int64) *int64 { return &v }
 func boolPtr(v bool) *bool    { return &v }
+func stringPtr(v string) *string { return &v }
 func vmStatePtr(v string) *string {
 	return &v
 }

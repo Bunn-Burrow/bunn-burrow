@@ -3,9 +3,12 @@ package vmm
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/omkar/sandbox/internal/network"
 )
 
 // Config holds the configuration required to create and start a Firecracker
@@ -58,6 +61,14 @@ type Config struct {
 	// rootfs creation is used (backward compatible).
 	TemplateID string
 
+	// Network optionally configures networking for the VM. When nil, the VM
+	// has no network interface (vsock only).
+	Network *NetworkConfig
+
+	// NetworkManager is an optional shared network manager for TAP/IPAM/firewall.
+	// When nil, the VM creates its own manager if Network is set.
+	NetworkManager *network.Manager
+
 	// StartTimeout bounds the wait for Firecracker to initialize its API socket.
 	StartTimeout time.Duration
 
@@ -80,6 +91,45 @@ func DefaultConfig() Config {
 		StartTimeout:     10 * time.Second,
 		StopTimeout:      15 * time.Second,
 		StopGraceTimeout: 5 * time.Second,
+	}
+}
+
+// NetworkConfig holds VM networking settings. It is a vmm-level (exported)
+// type so external modules can configure networking without importing the
+// internal network package.
+type NetworkConfig struct {
+	// Enabled enables VM networking.
+	Enabled bool
+
+	// Bridge is the Linux bridge name VM TAPs attach to.
+	Bridge string
+
+	// CIDR is the pool from which VM IPs are statically allocated.
+	CIDR string
+
+	// Gateway is the bridge/gateway IP for the VM subnet.
+	Gateway net.IP
+
+	// NATInterface is the host interface used for outbound masquerade.
+	NATInterface string
+
+	// Firewall enables nftables filtering (Layer-2 VM isolation + NAT).
+	Firewall bool
+
+	// MTU for TAP devices.
+	MTU int
+}
+
+// toInternal converts a vmm NetworkConfig to an internal network.Config.
+func (c *NetworkConfig) toInternal() network.Config {
+	return network.Config{
+		Enabled:       c.Enabled,
+		Bridge:        c.Bridge,
+		CIDR:          c.CIDR,
+		Gateway:       c.Gateway,
+		NATInterface:  c.NATInterface,
+		Firewall:      c.Firewall,
+		MTU:           c.MTU,
 	}
 }
 

@@ -21,10 +21,11 @@ const EnvPrefix = "BUNN_BURROW"
 
 // Config holds the Bunn Burrow CLI configuration.
 type Config struct {
-	Runtime RuntimeConfig `yaml:"runtime" mapstructure:"runtime"`
-	Storage StorageConfig `yaml:"storage" mapstructure:"storage"`
-	Logging LoggingConfig `yaml:"logging" mapstructure:"logging"`
-	Output  OutputConfig  `yaml:"output" mapstructure:"output"`
+	Runtime  RuntimeConfig  `yaml:"runtime" mapstructure:"runtime"`
+	Storage  StorageConfig  `yaml:"storage" mapstructure:"storage"`
+	Logging  LoggingConfig  `yaml:"logging" mapstructure:"logging"`
+	Output   OutputConfig   `yaml:"output" mapstructure:"output"`
+	Network  NetworkConfig  `yaml:"network" mapstructure:"network"`
 }
 
 // RuntimeConfig holds Firecracker runtime settings.
@@ -35,6 +36,17 @@ type RuntimeConfig struct {
 	WorkDir        string        `yaml:"work_dir" mapstructure:"work_dir"`
 	StartTimeout   time.Duration `yaml:"start_timeout" mapstructure:"start_timeout"`
 	StopTimeout    time.Duration `yaml:"stop_timeout" mapstructure:"stop_timeout"`
+}
+
+// NetworkConfig holds VM networking settings.
+type NetworkConfig struct {
+	Enabled        bool   `yaml:"enabled" mapstructure:"enabled"`
+	Bridge         string `yaml:"bridge" mapstructure:"bridge"`
+	CIDR           string `yaml:"cidr" mapstructure:"cidr"`
+	Gateway        string `yaml:"gateway" mapstructure:"gateway"`
+	NATInterface   string `yaml:"nat_interface" mapstructure:"nat_interface"`
+	Firewall       bool   `yaml:"firewall" mapstructure:"firewall"`
+	MTU            int    `yaml:"mtu" mapstructure:"mtu"`
 }
 
 // StorageConfig holds storage settings.
@@ -69,6 +81,13 @@ const (
 	KeyLoggingFormat         = "logging.format"
 	KeyOutputFormat          = "output.format"
 	KeyOutputColor           = "output.color"
+	KeyNetworkEnabled        = "network.enabled"
+	KeyNetworkBridge         = "network.bridge"
+	KeyNetworkCIDR           = "network.cidr"
+	KeyNetworkGateway        = "network.gateway"
+	KeyNetworkNATInterface   = "network.nat_interface"
+	KeyNetworkFirewall       = "network.firewall"
+	KeyNetworkMTU            = "network.mtu"
 )
 
 // Defaults returns a Config with sensible default values.
@@ -91,6 +110,13 @@ func Defaults() Config {
 		Output: OutputConfig{
 			Format: "table",
 			Color:  "auto",
+		},
+		Network: NetworkConfig{
+			Enabled:    false,
+			Bridge:     "br-bunn",
+			CIDR:       "10.11.0.0/16",
+			Firewall:   true,
+			MTU:        1500,
 		},
 	}
 }
@@ -119,6 +145,11 @@ func NewLoader() *Loader {
 	v.SetDefault(KeyLoggingFormat, Defaults().Logging.Format)
 	v.SetDefault(KeyOutputFormat, Defaults().Output.Format)
 	v.SetDefault(KeyOutputColor, Defaults().Output.Color)
+	v.SetDefault(KeyNetworkEnabled, Defaults().Network.Enabled)
+	v.SetDefault(KeyNetworkBridge, Defaults().Network.Bridge)
+	v.SetDefault(KeyNetworkCIDR, Defaults().Network.CIDR)
+	v.SetDefault(KeyNetworkFirewall, Defaults().Network.Firewall)
+	v.SetDefault(KeyNetworkMTU, Defaults().Network.MTU)
 
 	return &Loader{viper: v}
 }
@@ -239,5 +270,13 @@ func String(cfg Config) string {
 	b.WriteString("Output:\n")
 	b.WriteString(fmt.Sprintf("  format: %s\n", cfg.Output.Format))
 	b.WriteString(fmt.Sprintf("  color: %s\n", cfg.Output.Color))
+	b.WriteString("Network:\n")
+	b.WriteString(fmt.Sprintf("  enabled: %v\n", cfg.Network.Enabled))
+	b.WriteString(fmt.Sprintf("  bridge: %s\n", cfg.Network.Bridge))
+	b.WriteString(fmt.Sprintf("  cidr: %s\n", cfg.Network.CIDR))
+	b.WriteString(fmt.Sprintf("  gateway: %s\n", cfg.Network.Gateway))
+	b.WriteString(fmt.Sprintf("  nat_interface: %s\n", cfg.Network.NATInterface))
+	b.WriteString(fmt.Sprintf("  firewall: %v\n", cfg.Network.Firewall))
+	b.WriteString(fmt.Sprintf("  mtu: %d\n", cfg.Network.MTU))
 	return b.String()
 }
