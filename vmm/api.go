@@ -15,6 +15,7 @@ type API interface {
 	PutMachineConfiguration(ctx context.Context, cfg *models.MachineConfiguration) error
 	PutGuestBootSource(ctx context.Context, src *models.BootSource) error
 	PutGuestDriveByID(ctx context.Context, driveID string, d *models.Drive) error
+	PutGuestNetworkInterfaceByID(ctx context.Context, ifaceID string, ni *models.NetworkInterface) error
 	PutGuestVsock(ctx context.Context, vsock *models.Vsock) error
 	CreateSyncAction(ctx context.Context, action *models.InstanceActionInfo) error
 	PatchVM(ctx context.Context, vm *models.VM) error
@@ -49,6 +50,11 @@ func (a *apiClient) PutGuestBootSource(ctx context.Context, src *models.BootSour
 
 func (a *apiClient) PutGuestDriveByID(ctx context.Context, driveID string, d *models.Drive) error {
 	_, err := a.client.PutGuestDriveByID(ctx, driveID, d)
+	return err
+}
+
+func (a *apiClient) PutGuestNetworkInterfaceByID(ctx context.Context, ifaceID string, ni *models.NetworkInterface) error {
+	_, err := a.client.PutGuestNetworkInterfaceByID(ctx, ifaceID, ni)
 	return err
 }
 

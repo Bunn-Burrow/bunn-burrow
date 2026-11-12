@@ -28,6 +28,7 @@ type fakeAPI struct {
 	putBootSourceErr    error
 	putGuestDriveErr    error
 	putGuestVsockErr    error
+	putGuestNetIfaceErr error
 	createSyncActionErr error
 	patchVMErr          error
 	loadSnapshotErr     error
@@ -51,6 +52,12 @@ func (f *fakeAPI) PutGuestDriveByID(ctx context.Context, driveID string, d *mode
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "PutGuestDriveByID")
 	return f.putGuestDriveErr
+}
+func (f *fakeAPI) PutGuestNetworkInterfaceByID(ctx context.Context, ifaceID string, ni *models.NetworkInterface) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "PutGuestNetworkInterfaceByID")
+	return f.putGuestNetIfaceErr
 }
 func (f *fakeAPI) PutGuestVsock(ctx context.Context, vsock *models.Vsock) error {
 	f.mu.Lock()
