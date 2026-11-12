@@ -48,6 +48,9 @@ func main() {
 	pm := guestagent.NewProcessManager()
 	agent.SetProcessManager(pm)
 
+	// Create session manager for PTY sessions.
+	sm := guestagent.NewSessionManager()
+
 	// Build OCI config from flags.
 	oci := &guestagent.OCIConfig{}
 	if *entrypoint != "" {
@@ -77,7 +80,7 @@ func main() {
 	vsockServer := guestagent.NewVSockServer(8080, func() {
 		log.Println("vsock shutdown requested")
 		vsockCancel()
-	}, pm, oci, guestagent.DefaultWorkspaceLimits())
+	}, pm, sm, oci, guestagent.DefaultWorkspaceLimits())
 	if err := vsockServer.Listen(); err != nil {
 		log.Fatalf("vsock listen failed: %v", err)
 	}

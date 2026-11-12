@@ -29,13 +29,14 @@ type OCIConfig struct {
 }
 
 // Server is a vsock-based protocol server for the guest agent.
-// It listens on AF_VSOCK and handles health, shutdown, execution, and file
-// transfer requests.
+// It listens on AF_VSOCK and handles health, shutdown, execution, file
+// transfer, and PTY session requests.
 type Server struct {
 	listener    net.Listener
 	port        uint32
 	shutdown    func()
 	procManager *ProcessManager
+	sessionMgr  *SessionManager
 	ociConfig   *OCIConfig
 	writeMu     sync.Mutex
 	limits      WorkspaceLimits
@@ -43,7 +44,7 @@ type Server struct {
 
 // NewVSockServer creates a vsock server listening on the given port.
 // The shutdown function is called when a shutdown request is received.
-func NewVSockServer(port uint32, shutdown func(), pm *ProcessManager, oci *OCIConfig, limits WorkspaceLimits) *Server {
+func NewVSockServer(port uint32, shutdown func(), pm *ProcessManager, sm *SessionManager, oci *OCIConfig, limits WorkspaceLimits) *Server {
 	if limits.MaxTotalSize == 0 {
 		limits = DefaultWorkspaceLimits()
 	}
@@ -51,6 +52,7 @@ func NewVSockServer(port uint32, shutdown func(), pm *ProcessManager, oci *OCICo
 		port:        port,
 		shutdown:    shutdown,
 		procManager: pm,
+		sessionMgr:  sm,
 		ociConfig:   oci,
 		limits:      limits,
 	}
@@ -196,6 +198,18 @@ func (s *Server) handleConn(conn net.Conn) {
 				// Should not arrive outside tar mode; ignore.
 			case "download_file":
 				s.handleDownloadFile(conn, req)
+			case "session_start":
+				s.handleSessionStart(conn, req)
+			case "session_input":
+				s.handleSessionInput(conn, req)
+			case "session_resize":
+				s.handleSessionResize(conn, req)
+			case "session_status":
+				s.handleSessionStatus(conn, req)
+			case "session_terminate":
+				s.handleSessionTerminate(conn, req)
+			case "session_detach":
+				s.handleSessionDetach(conn, req)
 			case "prepare_snapshot":
 				s.handlePrepareSnapshot(conn, req)
 			case "sync_filesystems":
@@ -444,6 +458,210 @@ func (s *Server) handleDownloadFile(conn net.Conn, req map[string]any) {
 // filepathWorkspaceDir returns the guest workspace directory for a project.
 func filepathWorkspaceDir(projectID string) string {
 	return filepath.Join("/tmp/bunn-workspace", projectID)
+}
+
+// handleSessionStart creates a PTY-backed session and streams its output
+// back on the same connection.
+func (s *Server) handleSessionStart(conn net.Conn, req map[string]any) {
+	sessionID, _ := req["session_id"].(string)
+	if sessionID == "" {
+		s.writeError(conn, 400, "session_id is required")
+		return
+	}
+
+	cmd, _ := req["command"].(string)
+	if cmd == "" {
+		s.writeError(conn, 400, "command is required")
+		return
+	}
+
+	argsAny, _ := req["args"].([]any)
+	args := ArgsToSlice(argsAny)
+
+	envAny, _ := req["env"].(map[string]any)
+	env := MergeEnv(ociEnvSlice(s.ociConfig), envAny)
+
+	dir, _ := req["working_dir"].(string)
+	if dir == "" && s.ociConfig != nil {
+		dir = s.ociConfig.Workdir
+	}
+
+	rows, _ := req["rows"].(float64)
+	cols, _ := req["cols"].(float64)
+	size := TerminalSize{Rows: uint16(rows), Cols: uint16(cols)}
+
+	timeoutSec, _ := req["timeout_seconds"].(float64)
+	timeout := time.Duration(timeoutSec) * time.Second
+
+	info, err := s.sessionMgr.StartSession(sessionID, cmd, args, env, dir, size, timeout)
+	if err != nil {
+		s.writeError(conn, 500, err.Error())
+		return
+	}
+
+	started := map[string]any{
+		"kind":         "session_started",
+		"session_id":   sessionID,
+		"pid":          info.PID,
+		"rows":         info.Size.Rows,
+		"cols":         info.Size.Cols,
+	}
+	s.writeJSON(conn, started)
+
+	// Start streaming PTY output back on this connection.
+	outputCh, err := s.sessionMgr.ReceiveOutput(sessionID)
+	if err != nil {
+		s.writeError(conn, 500, err.Error())
+		s.sessionMgr.Terminate(sessionID)
+		return
+	}
+
+	go streamSessionOutput(conn, &s.writeMu, sessionID, outputCh)
+}
+
+// handleSessionInput sends input bytes to a session's PTY master.
+func (s *Server) handleSessionInput(conn net.Conn, req map[string]any) {
+	sessionID, _ := req["session_id"].(string)
+	if sessionID == "" {
+		s.writeError(conn, 400, "session_id is required")
+		return
+	}
+
+	data, _ := req["data"].(string)
+	if data == "" {
+		s.writeError(conn, 400, "data is required")
+		return
+	}
+
+	if err := s.sessionMgr.SendInput(sessionID, []byte(data)); err != nil {
+		s.writeError(conn, 500, err.Error())
+		return
+	}
+
+	s.writeJSON(conn, map[string]any{
+		"kind":         "session_input_acked",
+		"session_id":   sessionID,
+		"bytes":        len(data),
+	})
+}
+
+// handleSessionResize changes the terminal size of a session.
+func (s *Server) handleSessionResize(conn net.Conn, req map[string]any) {
+	sessionID, _ := req["session_id"].(string)
+	if sessionID == "" {
+		s.writeError(conn, 400, "session_id is required")
+		return
+	}
+
+	rows, ok := req["rows"].(float64)
+	if !ok {
+		s.writeError(conn, 400, "rows must be a number")
+		return
+	}
+	cols, ok := req["cols"].(float64)
+	if !ok {
+		s.writeError(conn, 400, "cols must be a number")
+		return
+	}
+
+	if err := s.sessionMgr.Resize(sessionID, uint16(rows), uint16(cols)); err != nil {
+		s.writeError(conn, 500, err.Error())
+		return
+	}
+
+	s.writeJSON(conn, map[string]any{
+		"kind":         "session_resized",
+		"session_id":   sessionID,
+		"rows":         rows,
+		"cols":         cols,
+	})
+}
+
+// handleSessionStatus returns the status of a session.
+func (s *Server) handleSessionStatus(conn net.Conn, req map[string]any) {
+	sessionID, _ := req["session_id"].(string)
+	if sessionID == "" {
+		s.writeError(conn, 400, "session_id is required")
+		return
+	}
+
+	status, err := s.sessionMgr.Status(sessionID)
+	if err != nil {
+		s.writeError(conn, 404, err.Error())
+		return
+	}
+
+	resp := map[string]any{
+		"kind":         "session_status",
+		"session_id":   sessionID,
+		"pid":          status.PID,
+		"done":         status.Done,
+		"exit_code":    status.ExitCode,
+		"rows":         status.Size.Rows,
+		"cols":         status.Size.Cols,
+	}
+	if status.Err != nil {
+		resp["error"] = status.Err.Error()
+	}
+	s.writeJSON(conn, resp)
+}
+
+// handleSessionTerminate ends a session.
+func (s *Server) handleSessionTerminate(conn net.Conn, req map[string]any) {
+	sessionID, _ := req["session_id"].(string)
+	if sessionID == "" {
+		s.writeError(conn, 400, "session_id is required")
+		return
+	}
+
+	if err := s.sessionMgr.Terminate(sessionID); err != nil {
+		s.writeError(conn, 404, err.Error())
+		return
+	}
+
+	s.writeJSON(conn, map[string]any{
+		"kind":         "session_terminated",
+		"session_id":   sessionID,
+	})
+}
+
+// handleSessionDetach disconnects from a session without terminating it.
+func (s *Server) handleSessionDetach(conn net.Conn, req map[string]any) {
+	sessionID, _ := req["session_id"].(string)
+	if sessionID == "" {
+		s.writeError(conn, 400, "session_id is required")
+		return
+	}
+
+	if err := s.sessionMgr.Detach(sessionID); err != nil {
+		s.writeError(conn, 404, err.Error())
+		return
+	}
+
+	s.writeJSON(conn, map[string]any{
+		"kind":         "session_detached",
+		"session_id":   sessionID,
+	})
+}
+
+// streamSessionOutput streams PTY output from outputCh to the connection.
+func streamSessionOutput(conn net.Conn, mu *sync.Mutex, sessionID string, outputCh <-chan []byte) {
+	for data := range outputCh {
+		msg := map[string]any{
+			"kind":         "session_output",
+			"session_id":   sessionID,
+			"data":         string(data),
+		}
+		if err := writeJSONSafe(conn, mu, msg); err != nil {
+			return
+		}
+	}
+
+	// Channel closed: session ended.
+	writeJSONSafe(conn, mu, map[string]any{
+		"kind":         "session_finished",
+		"session_id":   sessionID,
+	})
 }
 
 // streamOutput reads from a reader and sends execution_output messages.
