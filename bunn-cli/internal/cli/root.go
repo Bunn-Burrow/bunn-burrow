@@ -47,6 +47,7 @@ Use it to manage VMs, templates, snapshots, and inspect runtime health.`,
 	rootCmd.AddCommand(newConfigCommand(loader))
 	rootCmd.AddCommand(newVMCommand(loader))
 	rootCmd.AddCommand(newRuntimeCommand(loader))
+	rootCmd.AddCommand(newAgentCommand(loader))
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		// Load config (defaults + config file + env vars + bound flags).

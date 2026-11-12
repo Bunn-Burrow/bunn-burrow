@@ -54,11 +54,11 @@ func TestExtractTarValid(t *testing.T) {
 	tw := tar.NewWriter(&buf)
 
 	files := map[string]string{
-		"main.go":            `package main\nfunc main() {}`,
+		"main.go":                `package main\nfunc main() {}`,
 		"internal/app/server.go": `package app\nfunc Start() {}`,
-		"config/app.yaml":    `port: 8080\nhost: localhost`,
-		"empty.txt":          ``,
-		"nested/dir/readme.md": `# Project`,
+		"config/app.yaml":        `port: 8080\nhost: localhost`,
+		"empty.txt":              ``,
+		"nested/dir/readme.md":   `# Project`,
 	}
 	for name, content := range files {
 		hdr := &tar.Header{

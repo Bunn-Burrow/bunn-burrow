@@ -105,13 +105,13 @@ func buildVMMConfigFromViper(v *config.Loader, vmID string) (vmm.Config, error) 
 			gw = net.ParseIP(gwStr)
 		}
 		vmmCfg.Network = &vmm.NetworkConfig{
-			Enabled:       true,
-			Bridge:        v.Viper().GetString(config.KeyNetworkBridge),
-			CIDR:          v.Viper().GetString(config.KeyNetworkCIDR),
-			Gateway:       gw,
-			NATInterface:  v.Viper().GetString(config.KeyNetworkNATInterface),
-			Firewall:      v.Viper().GetBool(config.KeyNetworkFirewall),
-			MTU:           v.Viper().GetInt(config.KeyNetworkMTU),
+			Enabled:      true,
+			Bridge:       v.Viper().GetString(config.KeyNetworkBridge),
+			CIDR:         v.Viper().GetString(config.KeyNetworkCIDR),
+			Gateway:      gw,
+			NATInterface: v.Viper().GetString(config.KeyNetworkNATInterface),
+			Firewall:     v.Viper().GetBool(config.KeyNetworkFirewall),
+			MTU:          v.Viper().GetInt(config.KeyNetworkMTU),
 		}
 	}
 

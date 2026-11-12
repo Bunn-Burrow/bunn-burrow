@@ -58,6 +58,9 @@ type Project struct {
 // It is intentionally language-agnostic: any guest that runs a compatible
 // vsock exec server can host it.
 type Workload struct {
+	// ID is an optional unique execution identifier. If empty, "exec" is used.
+	ID string
+
 	// Cmd is the executable to run inside the guest.
 	Cmd string
 
@@ -191,6 +194,67 @@ func (s *Sandbox) Execute(ctx context.Context, w Workload, stdout, stderr io.Wri
 	return exitCode, nil
 }
 
+// CancelExecution sends a cancel request for the specified execution to the guest agent.
+func (s *Sandbox) CancelExecution(ctx context.Context, execID string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.State() != StateRunning {
+		return fmt.Errorf("sandbox VM not running (state=%s)", vm.State())
+	}
+
+	conn, err := vm.Vsock().Dial(ctx, s.cfg.VsockPort)
+	if err != nil {
+		return fmt.Errorf("sandbox vsock dial: %w", err)
+	}
+	defer conn.Close()
+
+	req := map[string]any{
+		"kind":         "cancel",
+		"execution_id": execID,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal cancel request: %w", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		return fmt.Errorf("write cancel request length: %w", err)
+	}
+	if err := writeFull(conn, payload); err != nil {
+		return fmt.Errorf("write cancel request payload: %w", err)
+	}
+
+	// Read response (framed JSON).
+	var respLenBuf [4]byte
+	if _, err := io.ReadFull(conn, respLenBuf[:]); err != nil {
+		return fmt.Errorf("read cancel response length: %w", err)
+	}
+	frameLen := binary.BigEndian.Uint32(respLenBuf[:])
+	if frameLen == 0 || frameLen > 1<<20 {
+		return fmt.Errorf("invalid response frame length: %d", frameLen)
+	}
+	respPayload := make([]byte, frameLen)
+	if _, err := io.ReadFull(conn, respPayload); err != nil {
+		return fmt.Errorf("read cancel response payload: %w", err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(respPayload, &resp); err != nil {
+		return fmt.Errorf("unmarshal cancel response: %w", err)
+	}
+	if kind, _ := resp["kind"].(string); kind == "error" {
+		msg, _ := resp["message"].(string)
+		return fmt.Errorf("guest cancel error: %s", msg)
+	}
+	return nil
+}
+
 // runExec sends the exec request over conn and streams guest responses until
 // an exit or error message is received, or ctx is cancelled.
 //
@@ -200,9 +264,13 @@ func (s *Sandbox) Execute(ctx context.Context, w Workload, stdout, stderr io.Wri
 // "execution_started", "execution_output", "execution_finished", and "error".
 func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, stderr io.Writer, stdin io.Reader) (int, error) {
 	// Send the execute request with length-prefixed JSON framing.
+	execID := w.ID
+	if execID == "" {
+		execID = "exec"
+	}
 	req := map[string]any{
 		"kind":            "execute",
-		"execution_id":    "exec",
+		"execution_id":    execID,
 		"command":         w.Cmd,
 		"args":            w.Args,
 		"env":             w.Env,
