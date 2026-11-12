@@ -108,7 +108,7 @@ func TestRunExecStreamsOutputAndReturnsExitCode(t *testing.T) {
 	stdout := &strings.Builder{}
 	stderr := &strings.Builder{}
 	code, err := runExec(context.Background(), conn, Workload{
-		Cmd: "/bin/sh",
+		Cmd:  "/bin/sh",
 		Args: []string{"-c", "echo hello world; echo warning >&2; exit 42"},
 	}, stdout, stderr, nil)
 	require.NoError(t, err)
@@ -283,10 +283,10 @@ func TestSandboxExecuteSendsCorrectRequest(t *testing.T) {
 func TestValidateProject(t *testing.T) {
 	t.Run("valid project", func(t *testing.T) {
 		p := &Project{
-			ID:   "test-proj",
+			ID: "test-proj",
 			Files: map[string][]byte{
-				"main.go":  []byte("package main\n"),
-				"go.mod":   []byte("module test\n"),
+				"main.go": []byte("package main\n"),
+				"go.mod":  []byte("module test\n"),
 			},
 		}
 		require.NoError(t, validateProject(p))
@@ -317,7 +317,7 @@ func TestValidateProject(t *testing.T) {
 
 	t.Run("absolute path rejected", func(t *testing.T) {
 		p := &Project{
-			ID:   "test-proj",
+			ID:    "test-proj",
 			Files: map[string][]byte{"/etc/passwd": []byte("x")},
 		}
 		require.Error(t, validateProject(p))
@@ -325,7 +325,7 @@ func TestValidateProject(t *testing.T) {
 
 	t.Run("path traversal rejected", func(t *testing.T) {
 		p := &Project{
-			ID:   "test-proj",
+			ID:    "test-proj",
 			Files: map[string][]byte{"../secret.txt": []byte("x")},
 		}
 		require.Error(t, validateProject(p))
@@ -333,7 +333,7 @@ func TestValidateProject(t *testing.T) {
 
 	t.Run("oversized project rejected", func(t *testing.T) {
 		p := &Project{
-			ID:   "test-proj",
+			ID: "test-proj",
 			Files: map[string][]byte{
 				"big.txt": bytes.Repeat([]byte("x"), MaxProjectSize+1),
 			},
@@ -343,7 +343,7 @@ func TestValidateProject(t *testing.T) {
 
 	t.Run("oversized individual file rejected", func(t *testing.T) {
 		p := &Project{
-			ID:   "test-proj",
+			ID: "test-proj",
 			Files: map[string][]byte{
 				"big.txt": bytes.Repeat([]byte("x"), MaxStdinSize+1),
 			},
@@ -376,10 +376,10 @@ func TestValidateProjectPathHost(t *testing.T) {
 
 func TestProjectToTar(t *testing.T) {
 	p := &Project{
-		ID:   "test-proj",
+		ID: "test-proj",
 		Files: map[string][]byte{
-			"main.go":  []byte("package main\n"),
-			"go.mod":   []byte("module test\n"),
+			"main.go":              []byte("package main\n"),
+			"go.mod":               []byte("module test\n"),
 			"nested/dir/server.go": []byte("package server\n"),
 		},
 		DirPerm:  0o750,
@@ -418,7 +418,7 @@ func TestProjectToTar(t *testing.T) {
 
 func TestProjectToTarEmptyFile(t *testing.T) {
 	p := &Project{
-		ID:   "test-proj",
+		ID: "test-proj",
 		Files: map[string][]byte{
 			"empty.txt": []byte{},
 		},
@@ -526,14 +526,14 @@ func StartSessionTest(ctx context.Context, conn *fakeConn, cfg SessionConfig) (*
 	sessionID := newSessionID()
 
 	req := map[string]any{
-		"kind":           "session_start",
-		"session_id":     sessionID,
-		"command":        cfg.Cmd,
-		"args":           cfg.Args,
-		"env":            cfg.Env,
-		"working_dir":    cfg.Dir,
-		"rows":           cfg.Rows,
-		"cols":           cfg.Cols,
+		"kind":            "session_start",
+		"session_id":      sessionID,
+		"command":         cfg.Cmd,
+		"args":            cfg.Args,
+		"env":             cfg.Env,
+		"working_dir":     cfg.Dir,
+		"rows":            cfg.Rows,
+		"cols":            cfg.Cols,
 		"timeout_seconds": cfg.Timeout.Seconds(),
 	}
 	payload, err := json.Marshal(req)
@@ -592,14 +592,13 @@ func StartSessionTest(ctx context.Context, conn *fakeConn, cfg SessionConfig) (*
 			return nil, fmt.Errorf("unexpected response: %v", res.msg)
 		}
 		sess := &Session{
-			conn:       conn,
-			sessionID:  sessionID,
-			done:       make(chan struct{}),
-			outputCh:   make(chan []byte, 128),
-			errCh:      make(chan error, 1),
+			conn:      conn,
+			sessionID: sessionID,
+			done:      make(chan struct{}),
+			outputCh:  make(chan []byte, 128),
+			errCh:     make(chan error, 1),
 		}
 		go sess.readLoop(msgCh)
 		return sess, nil
 	}
 }
-

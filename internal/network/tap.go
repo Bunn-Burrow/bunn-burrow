@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/vishvananda/netlink"
 	"github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 )
 
 // TapManager creates and removes TAP devices for VMs.

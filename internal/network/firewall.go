@@ -11,12 +11,12 @@ import (
 // Firewall manages nftables rules for VM networking: Layer-2 isolation,
 // NAT/masquerade for outbound, and forwarding.
 type Firewall struct {
-	bridge     string
-	cidr       string
-	natIface   string
-	logger     *logrus.Entry
-	tableName  string
-	chainName  string
+	bridge    string
+	cidr      string
+	natIface  string
+	logger    *logrus.Entry
+	tableName string
+	chainName string
 }
 
 // NewFirewall creates a Firewall manager.

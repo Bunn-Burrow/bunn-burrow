@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/vishvananda/netlink"
 	"github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 )
 
 // BridgeManager creates and manages a Linux bridge for VM TAPs.
