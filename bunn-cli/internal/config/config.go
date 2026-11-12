@@ -21,11 +21,11 @@ const EnvPrefix = "BUNN_BURROW"
 
 // Config holds the Bunn Burrow CLI configuration.
 type Config struct {
-	Runtime  RuntimeConfig  `yaml:"runtime" mapstructure:"runtime"`
-	Storage  StorageConfig  `yaml:"storage" mapstructure:"storage"`
-	Logging  LoggingConfig  `yaml:"logging" mapstructure:"logging"`
-	Output   OutputConfig   `yaml:"output" mapstructure:"output"`
-	Network  NetworkConfig  `yaml:"network" mapstructure:"network"`
+	Runtime RuntimeConfig `yaml:"runtime" mapstructure:"runtime"`
+	Storage StorageConfig `yaml:"storage" mapstructure:"storage"`
+	Logging LoggingConfig `yaml:"logging" mapstructure:"logging"`
+	Output  OutputConfig  `yaml:"output" mapstructure:"output"`
+	Network NetworkConfig `yaml:"network" mapstructure:"network"`
 }
 
 // RuntimeConfig holds Firecracker runtime settings.
@@ -40,13 +40,13 @@ type RuntimeConfig struct {
 
 // NetworkConfig holds VM networking settings.
 type NetworkConfig struct {
-	Enabled        bool   `yaml:"enabled" mapstructure:"enabled"`
-	Bridge         string `yaml:"bridge" mapstructure:"bridge"`
-	CIDR           string `yaml:"cidr" mapstructure:"cidr"`
-	Gateway        string `yaml:"gateway" mapstructure:"gateway"`
-	NATInterface   string `yaml:"nat_interface" mapstructure:"nat_interface"`
-	Firewall       bool   `yaml:"firewall" mapstructure:"firewall"`
-	MTU            int    `yaml:"mtu" mapstructure:"mtu"`
+	Enabled      bool   `yaml:"enabled" mapstructure:"enabled"`
+	Bridge       string `yaml:"bridge" mapstructure:"bridge"`
+	CIDR         string `yaml:"cidr" mapstructure:"cidr"`
+	Gateway      string `yaml:"gateway" mapstructure:"gateway"`
+	NATInterface string `yaml:"nat_interface" mapstructure:"nat_interface"`
+	Firewall     bool   `yaml:"firewall" mapstructure:"firewall"`
+	MTU          int    `yaml:"mtu" mapstructure:"mtu"`
 }
 
 // StorageConfig holds storage settings.
@@ -112,11 +112,11 @@ func Defaults() Config {
 			Color:  "auto",
 		},
 		Network: NetworkConfig{
-			Enabled:    false,
-			Bridge:     "br-bunn",
-			CIDR:       "10.11.0.0/16",
-			Firewall:   true,
-			MTU:        1500,
+			Enabled:  false,
+			Bridge:   "br-bunn",
+			CIDR:     "10.11.0.0/16",
+			Firewall: true,
+			MTU:      1500,
 		},
 	}
 }

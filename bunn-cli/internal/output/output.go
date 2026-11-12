@@ -78,6 +78,16 @@ func NewWriter(format Format, color string) *Writer {
 	}
 }
 
+// SetOutput configures custom destination writers for standard and error output.
+func (w *Writer) SetOutput(out, err io.Writer) {
+	if out != nil {
+		w.out = out
+	}
+	if err != nil {
+		w.err = err
+	}
+}
+
 // NewStyles creates a style set.
 func NewStyles(useColor bool) *Styles {
 	if !useColor {

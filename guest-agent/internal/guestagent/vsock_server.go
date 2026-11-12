@@ -500,11 +500,11 @@ func (s *Server) handleSessionStart(conn net.Conn, req map[string]any) {
 	}
 
 	started := map[string]any{
-		"kind":         "session_started",
-		"session_id":   sessionID,
-		"pid":          info.PID,
-		"rows":         info.Size.Rows,
-		"cols":         info.Size.Cols,
+		"kind":       "session_started",
+		"session_id": sessionID,
+		"pid":        info.PID,
+		"rows":       info.Size.Rows,
+		"cols":       info.Size.Cols,
 	}
 	s.writeJSON(conn, started)
 
@@ -539,9 +539,9 @@ func (s *Server) handleSessionInput(conn net.Conn, req map[string]any) {
 	}
 
 	s.writeJSON(conn, map[string]any{
-		"kind":         "session_input_acked",
-		"session_id":   sessionID,
-		"bytes":        len(data),
+		"kind":       "session_input_acked",
+		"session_id": sessionID,
+		"bytes":      len(data),
 	})
 }
 
@@ -570,10 +570,10 @@ func (s *Server) handleSessionResize(conn net.Conn, req map[string]any) {
 	}
 
 	s.writeJSON(conn, map[string]any{
-		"kind":         "session_resized",
-		"session_id":   sessionID,
-		"rows":         rows,
-		"cols":         cols,
+		"kind":       "session_resized",
+		"session_id": sessionID,
+		"rows":       rows,
+		"cols":       cols,
 	})
 }
 
@@ -592,13 +592,13 @@ func (s *Server) handleSessionStatus(conn net.Conn, req map[string]any) {
 	}
 
 	resp := map[string]any{
-		"kind":         "session_status",
-		"session_id":   sessionID,
-		"pid":          status.PID,
-		"done":         status.Done,
-		"exit_code":    status.ExitCode,
-		"rows":         status.Size.Rows,
-		"cols":         status.Size.Cols,
+		"kind":       "session_status",
+		"session_id": sessionID,
+		"pid":        status.PID,
+		"done":       status.Done,
+		"exit_code":  status.ExitCode,
+		"rows":       status.Size.Rows,
+		"cols":       status.Size.Cols,
 	}
 	if status.Err != nil {
 		resp["error"] = status.Err.Error()
@@ -620,8 +620,8 @@ func (s *Server) handleSessionTerminate(conn net.Conn, req map[string]any) {
 	}
 
 	s.writeJSON(conn, map[string]any{
-		"kind":         "session_terminated",
-		"session_id":   sessionID,
+		"kind":       "session_terminated",
+		"session_id": sessionID,
 	})
 }
 
@@ -639,8 +639,8 @@ func (s *Server) handleSessionDetach(conn net.Conn, req map[string]any) {
 	}
 
 	s.writeJSON(conn, map[string]any{
-		"kind":         "session_detached",
-		"session_id":   sessionID,
+		"kind":       "session_detached",
+		"session_id": sessionID,
 	})
 }
 
@@ -648,9 +648,9 @@ func (s *Server) handleSessionDetach(conn net.Conn, req map[string]any) {
 func streamSessionOutput(conn net.Conn, mu *sync.Mutex, sessionID string, outputCh <-chan []byte) {
 	for data := range outputCh {
 		msg := map[string]any{
-			"kind":         "session_output",
-			"session_id":   sessionID,
-			"data":         string(data),
+			"kind":       "session_output",
+			"session_id": sessionID,
+			"data":       string(data),
 		}
 		if err := writeJSONSafe(conn, mu, msg); err != nil {
 			return
@@ -659,8 +659,8 @@ func streamSessionOutput(conn net.Conn, mu *sync.Mutex, sessionID string, output
 
 	// Channel closed: session ended.
 	writeJSONSafe(conn, mu, map[string]any{
-		"kind":         "session_finished",
-		"session_id":   sessionID,
+		"kind":       "session_finished",
+		"session_id": sessionID,
 	})
 }
 

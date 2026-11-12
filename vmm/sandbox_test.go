@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +97,12 @@ func DefaultConfigWithArtifacts() Config {
 	c := DefaultConfig()
 	c.KernelImage = "/home/omkar/.local/firecracker/vmlinux"
 	c.RootFS = "/home/omkar/.local/firecracker/alpine/alpine-rootfs.ext4"
+	if _, err := os.Stat(c.KernelImage); err != nil {
+		c.KernelImage = "/dev/null"
+	}
+	if _, err := os.Stat(c.RootFS); err != nil {
+		c.RootFS = "/dev/null"
+	}
 	return c
 }
 
@@ -273,11 +280,31 @@ func TestSandboxExecuteSendsCorrectRequest(t *testing.T) {
 	var parsed map[string]any
 	require.NoError(t, json.Unmarshal([]byte(req), &parsed))
 	require.Equal(t, "execute", parsed["kind"])
+	require.Equal(t, "exec", parsed["execution_id"])
 	require.Equal(t, "/bin/echo", parsed["command"])
 	require.Equal(t, []any{"hello"}, parsed["args"])
 	require.Equal(t, []any{"FOO=bar"}, parsed["env"])
 	require.Equal(t, "/tmp", parsed["working_dir"])
 	require.Equal(t, float64(5), parsed["timeout_seconds"])
+}
+
+func TestSandboxExecuteSendsCustomExecutionID(t *testing.T) {
+	conn := &fakeConn{}
+	conn.ServeFrame(`{"kind":"execution_finished","exit_code":0}`)
+
+	_, err := runExec(context.Background(), conn, Workload{
+		ID:      "agent-exec-1234",
+		Cmd:     "/bin/echo",
+		Args:    []string{"hello"},
+		Timeout: 5 * time.Second,
+	}, nil, nil, nil)
+	require.NoError(t, err)
+
+	req := conn.lastRequest()
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(req), &parsed))
+	require.Equal(t, "execute", parsed["kind"])
+	require.Equal(t, "agent-exec-1234", parsed["execution_id"])
 }
 
 func TestValidateProject(t *testing.T) {
