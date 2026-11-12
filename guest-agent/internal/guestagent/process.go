@@ -55,7 +55,8 @@ func NewProcessManager() *ProcessManager {
 
 // Start launches a new process and returns its execution ID.
 // The caller receives output via the returned stdout/stderr readers.
-func (pm *ProcessManager) Start(id, cmd string, args []string, env []string, dir string, user string, timeout time.Duration) (*ProcessInfo, error) {
+// If stdin is non-nil, it is wired to the process's standard input.
+func (pm *ProcessManager) Start(id, cmd string, args []string, env []string, dir string, user string, timeout time.Duration, stdin io.Reader) (*ProcessInfo, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -76,6 +77,10 @@ func (pm *ProcessManager) Start(id, cmd string, args []string, env []string, dir
 	if user != "" {
 		command.SysProcAttr = &syscall.SysProcAttr{}
 		_ = user // user switching requires additional privilege handling (no-op for now)
+	}
+
+	if stdin != nil {
+		command.Stdin = stdin
 	}
 
 	stdout, err := command.StdoutPipe()

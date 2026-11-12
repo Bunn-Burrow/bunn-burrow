@@ -73,11 +73,11 @@ func main() {
 		log.Println("agent shutdown initiated")
 	})
 
-	// Start vsock server for health, shutdown, and execution requests.
+	// Start vsock server for health, shutdown, execution, and file transfer requests.
 	vsockServer := guestagent.NewVSockServer(8080, func() {
 		log.Println("vsock shutdown requested")
 		vsockCancel()
-	}, pm, oci)
+	}, pm, oci, guestagent.DefaultWorkspaceLimits())
 	if err := vsockServer.Listen(); err != nil {
 		log.Fatalf("vsock listen failed: %v", err)
 	}
