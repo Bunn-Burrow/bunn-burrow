@@ -1,6 +1,7 @@
 package guestagent
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -177,6 +178,11 @@ func (s *Server) handleShutdown(conn net.Conn) {
 
 // handleExecute starts a process and streams output over the connection.
 func (s *Server) handleExecute(conn net.Conn, req map[string]any) {
+	if err := validateExecuteRequest(req); err != nil {
+		s.writeError(conn, 400, err.Error())
+		return
+	}
+
 	execID, _ := req["execution_id"].(string)
 	if execID == "" {
 		s.writeError(conn, 400, "execution_id is required")
@@ -225,7 +231,12 @@ func (s *Server) handleExecute(conn net.Conn, req map[string]any) {
 	timeoutSec, _ := req["timeout_seconds"].(float64)
 	timeout := time.Duration(timeoutSec) * time.Second
 
-	info, err := s.procManager.Start(execID, cmd, args, env, dir, user, timeout)
+	var stdin io.Reader
+	if stdinStr, ok := req["stdin"].(string); ok && stdinStr != "" {
+		stdin = strings.NewReader(stdinStr)
+	}
+
+	info, err := s.procManager.Start(execID, cmd, args, env, dir, user, timeout, stdin)
 	if err != nil {
 		s.writeError(conn, 500, err.Error())
 		return
@@ -423,12 +434,21 @@ func writeJSONSafe(
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
 
-	if _, err := conn.Write(lenBuf[:]); err != nil {
+	if err := writeFull(conn, lenBuf[:]); err != nil {
 		return err
 	}
 
-	_, err = conn.Write(payload)
-	return err
+	return writeFull(conn, payload)
+}
+
+// writeFull writes all of buf to w, returning an error if the write is
+// incomplete. It handles partial writes from connections such as vsock.
+func writeFull(w io.Writer, buf []byte) error {
+	_, err := io.CopyBuffer(w, bytes.NewReader(buf), make([]byte, len(buf)))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // writeJSON sends a JSON response with length-prefixed framing.
@@ -454,6 +474,32 @@ func ociEnvSlice(oci *OCIConfig) []string {
 		return nil
 	}
 	return oci.Env
+}
+
+// validateExecuteRequest checks that an execute request has all required
+// fields before a process is started.
+func validateExecuteRequest(req map[string]any) error {
+	execID, _ := req["execution_id"].(string)
+	if execID == "" {
+		return errors.New("execution_id is required")
+	}
+
+	cmd, _ := req["command"].(string)
+	if cmd == "" {
+		return errors.New("command is required")
+	}
+
+	if timeoutVal, ok := req["timeout_seconds"]; ok {
+		timeoutSec, ok := timeoutVal.(float64)
+		if !ok {
+			return errors.New("timeout_seconds must be a number")
+		}
+		if timeoutSec < 0 {
+			return errors.New("timeout_seconds must be non-negative")
+		}
+	}
+
+	return nil
 }
 
 // snapshotRequestState tracks snapshot coordination state for a single

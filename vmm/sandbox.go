@@ -1,7 +1,9 @@
 package vmm
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,11 @@ import (
 	"sync"
 	"time"
 )
+
+// MaxStdinSize is the maximum size of stdin data that can be sent with an
+// execution request. Stdin is buffered entirely before transmission; it is
+// not streamed.
+const MaxStdinSize = 1 << 20 // 1 MiB
 
 // Workload describes a generic command to execute inside an isolated guest VM.
 // It is intentionally language-agnostic: any guest that runs a compatible
@@ -26,6 +33,10 @@ type Workload struct {
 	// Dir is the working directory inside the guest.
 	Dir string
 
+	// Stdin is the standard input fed to the process. If nil, the process
+	// receives an empty stdin.
+	Stdin io.Reader
+
 	// Timeout bounds how long the workload may run. A zero or negative value
 	// means no per-workload timeout (the parent context still applies).
 	Timeout time.Duration
@@ -42,19 +53,20 @@ type Workload struct {
 // Each Sandbox VM has a unique identity, private working directory, unique API
 // and vsock socket paths, and (by default) an isolated writable rootfs copy so
 // two sandboxes never share mutable disk. The guest must run a vsock exec
-// server that speaks the newline-delimited JSON protocol documented below for
+// server that speaks the length-prefixed JSON protocol documented below for
 // Execute to succeed.
 //
-// Protocol (newline-delimited JSON, host -> guest):
+// Protocol (length-prefixed JSON, host -> guest):
 //
-//	{"kind":"exec","cmd":"/bin/sh","args":["-c","echo hi"],"env":[],"cwd":"/","timeout_ms":30000}
+//	4-byte big-endian length prefix + JSON payload
+//	{"kind":"execute","execution_id":"...","command":"/bin/sh","args":["-c","echo hi"],"env":[],"working_dir":"/","timeout_seconds":30}
 //
-// Guest -> host:
+// Guest -> host (same framing):
 //
-//	{"kind":"stdout","data":"hello\n"}
-//	{"kind":"stderr","data":"..."}
-//	{"kind":"exit","code":0}
-//	{"kind":"error","message":"..."}
+//	{"kind":"execution_started","execution_id":"...","pid":123}
+//	{"kind":"execution_output","execution_id":"...","stream":"stdout","data":"hello\n"}
+//	{"kind":"execution_finished","execution_id":"...","exit_code":0}
+//	{"kind":"error","code":500,"message":"..."}
 type Sandbox struct {
 	mu   sync.Mutex
 	vm   *VM
@@ -133,7 +145,7 @@ func (s *Sandbox) Execute(ctx context.Context, w Workload, stdout, stderr io.Wri
 	}
 	defer conn.Close()
 
-	exitCode, err := runExec(execCtx, conn, w, stdout, stderr)
+	exitCode, err := runExec(execCtx, conn, w, stdout, stderr, w.Stdin)
 	if err != nil {
 		return exitCode, err
 	}
@@ -142,23 +154,51 @@ func (s *Sandbox) Execute(ctx context.Context, w Workload, stdout, stderr io.Wri
 
 // runExec sends the exec request over conn and streams guest responses until
 // an exit or error message is received, or ctx is cancelled.
-func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, stderr io.Writer) (int, error) {
-	enc := json.NewEncoder(conn)
-	dec := json.NewDecoder(conn)
-
-	if err := enc.Encode(map[string]any{
-		"kind":       "exec",
-		"cmd":        w.Cmd,
-		"args":       w.Args,
-		"env":        w.Env,
-		"cwd":        w.Dir,
-		"timeout_ms": w.Timeout.Milliseconds(),
-	}); err != nil {
-		return -1, fmt.Errorf("sandbox send workload: %w", err)
+//
+// The wire protocol uses length-prefixed JSON framing (4-byte big-endian
+// length prefix followed by the JSON payload), matching the guest agent's
+// vsock server. Request kind is "execute"; response kinds are
+// "execution_started", "execution_output", "execution_finished", and "error".
+func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, stderr io.Writer, stdin io.Reader) (int, error) {
+	// Send the execute request with length-prefixed JSON framing.
+	req := map[string]any{
+		"kind":            "execute",
+		"execution_id":    "exec",
+		"command":         w.Cmd,
+		"args":            w.Args,
+		"env":             w.Env,
+		"working_dir":     w.Dir,
+		"timeout_seconds": w.Timeout.Seconds(),
+	}
+	if stdin != nil {
+		// Stdin is buffered entirely before transmission; it is not streamed.
+		// Bound the size to avoid unbounded memory usage.
+		limited := io.LimitReader(stdin, MaxStdinSize+1)
+		data, err := io.ReadAll(limited)
+		if err != nil {
+			return -1, fmt.Errorf("read stdin: %w", err)
+		}
+		if int64(len(data)) > MaxStdinSize {
+			return -1, fmt.Errorf("stdin exceeds maximum size of %d bytes", MaxStdinSize)
+		}
+		req["stdin"] = string(data)
 	}
 
-	// Decode guest messages on a single goroutine so context cancellation can
-	// interrupt a blocking read without concurrent decoder access.
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return -1, fmt.Errorf("marshal execute request: %w", err)
+	}
+
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		return -1, fmt.Errorf("write request length: %w", err)
+	}
+	if err := writeFull(conn, payload); err != nil {
+		return -1, fmt.Errorf("write request payload: %w", err)
+	}
+
+	// Read framed responses until exit/error or context cancellation.
 	type decodeResult struct {
 		msg map[string]any
 		err error
@@ -168,8 +208,23 @@ func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, s
 	go func() {
 		defer close(done)
 		for {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			frameLen := binary.BigEndian.Uint32(lenBuf[:])
+			if frameLen == 0 || frameLen > 1<<20 {
+				msgCh <- decodeResult{err: fmt.Errorf("invalid frame length: %d", frameLen)}
+				return
+			}
+			payload := make([]byte, frameLen)
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
 			var msg map[string]any
-			if err := dec.Decode(&msg); err != nil {
+			if err := json.Unmarshal(payload, &msg); err != nil {
 				msgCh <- decodeResult{err: err}
 				return
 			}
@@ -184,31 +239,34 @@ func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, s
 			return exitCode, ctx.Err()
 		case res, ok := <-msgCh:
 			if !ok {
-				return exitCode, nil
+				return exitCode, errors.New("guest connection closed before execution finished")
 			}
 			if res.err != nil {
-				if errors.Is(res.err, io.EOF) {
-					return exitCode, nil
+				if errors.Is(res.err, io.EOF) || errors.Is(res.err, io.ErrUnexpectedEOF) {
+					return exitCode, errors.New("guest connection closed before execution finished")
 				}
-				return exitCode, fmt.Errorf("sandbox read guest message: %w", res.err)
+				return exitCode, fmt.Errorf("read guest message: %w", res.err)
 			}
 
 			switch kind, _ := res.msg["kind"].(string); kind {
-			case "stdout":
-				if data, _ := res.msg["data"].(string); data != "" {
+			case "execution_output":
+				stream, _ := res.msg["stream"].(string)
+				data, _ := res.msg["data"].(string)
+				if data == "" {
+					continue
+				}
+				switch stream {
+				case "stdout":
 					if _, werr := stdout.Write([]byte(data)); werr != nil {
 						return exitCode, werr
 					}
-				}
-			case "stderr":
-				if data, _ := res.msg["data"].(string); data != "" {
+				case "stderr":
 					if _, werr := stderr.Write([]byte(data)); werr != nil {
 						return exitCode, werr
 					}
 				}
-			case "exit":
-				exitCode = -1
-				if code, ok := res.msg["code"].(float64); ok {
+			case "execution_finished":
+				if code, ok := res.msg["exit_code"].(float64); ok {
 					exitCode = int(code)
 				}
 				return exitCode, nil
@@ -222,6 +280,16 @@ func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, s
 			}
 		}
 	}
+}
+
+// writeFull writes all of buf to w, returning an error if the write is
+// incomplete. It handles partial writes from connections such as vsock.
+func writeFull(w io.Writer, buf []byte) error {
+	_, err := io.CopyBuffer(w, bytes.NewReader(buf), make([]byte, len(buf)))
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Close stops and destroys the sandboxed VM, releasing all owned resources.
