@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,7 +29,8 @@ type OCIConfig struct {
 }
 
 // Server is a vsock-based protocol server for the guest agent.
-// It listens on AF_VSOCK and handles health, shutdown, and execution requests.
+// It listens on AF_VSOCK and handles health, shutdown, execution, and file
+// transfer requests.
 type Server struct {
 	listener    net.Listener
 	port        uint32
@@ -35,16 +38,21 @@ type Server struct {
 	procManager *ProcessManager
 	ociConfig   *OCIConfig
 	writeMu     sync.Mutex
+	limits      WorkspaceLimits
 }
 
 // NewVSockServer creates a vsock server listening on the given port.
 // The shutdown function is called when a shutdown request is received.
-func NewVSockServer(port uint32, shutdown func(), pm *ProcessManager, oci *OCIConfig) *Server {
+func NewVSockServer(port uint32, shutdown func(), pm *ProcessManager, oci *OCIConfig, limits WorkspaceLimits) *Server {
+	if limits.MaxTotalSize == 0 {
+		limits = DefaultWorkspaceLimits()
+	}
 	return &Server{
 		port:        port,
 		shutdown:    shutdown,
 		procManager: pm,
 		ociConfig:   oci,
+		limits:      limits,
 	}
 }
 
@@ -80,9 +88,28 @@ func (s *Server) Serve() error {
 	}
 }
 
+// connMode tracks the protocol state of a vsock connection.
+type connMode int
+
+const (
+	// modeControl is the default state: frames are JSON control messages.
+	modeControl connMode = iota
+	// modeReceivingTar: frames are raw tar archive bytes until upload_complete.
+	modeReceivingTar
+	// modeSendingFile: frames are raw file bytes until download_complete is sent.
+	modeSendingFile
+)
+
 // handleConn processes a single vsock connection using length-prefixed JSON framing.
+// Control messages are JSON; bulk data (tar archives, file contents) is sent as
+// raw length-prefixed binary frames interleaved with JSON control markers.
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+
+	mode := modeControl
+	var projectID string
+	var workspaceDir string
+	var tarBuf []byte
 
 	for {
 		// Read 4-byte length prefix.
@@ -99,48 +126,89 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		}
 
-		// Read JSON payload.
+		// Read payload.
 		payload := make([]byte, frameLen)
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			log.Printf("vsock read payload: %v", err)
 			return
 		}
 
-		// Parse the request.
-		var req map[string]any
-		if err := json.Unmarshal(payload, &req); err != nil {
-			s.writeError(conn, 400, "invalid JSON")
-			continue
-		}
+		switch mode {
+		case modeReceivingTar:
+			// Try to detect upload_complete control message.
+			if len(payload) > 0 && payload[0] == '{' {
+				var req map[string]any
+				if err := json.Unmarshal(payload, &req); err == nil {
+					if kind, _ := req["kind"].(string); kind == "upload_complete" {
+						if err := extractTar(bytes.NewReader(tarBuf), workspaceDir, s.limits); err != nil {
+							s.writeError(conn, 500, err.Error())
+						} else {
+							s.writeJSON(conn, map[string]any{
+								"kind":       "upload_finished",
+								"project_id": projectID,
+								"status":     "ok",
+							})
+						}
+						mode = modeControl
+						projectID = ""
+						workspaceDir = ""
+						tarBuf = nil
+						continue
+					}
+				}
+			}
+			// Raw tar data frame.
+			tarBuf = append(tarBuf, payload...)
 
-		kind, _ := req["kind"].(string)
+		case modeSendingFile:
+			// This mode is transient: the guest sends file data frames then
+			// download_complete. It is set by handleDownloadFile and cleared
+			// after the last frame.
+			_ = payload
+			_ = projectID
+			return
 
-		switch kind {
-		case "protocol":
-			s.handleProtocol(conn, req)
-		case "health":
-			s.handleHealth(conn)
-		case "shutdown":
-			s.handleShutdown(conn)
-			return // Close connection after shutdown request
-		case "execute":
-			s.handleExecute(conn, req)
-		case "cancel":
-			s.handleCancel(conn, req)
-		case "status":
-			s.handleStatus(conn, req)
-		case "prepare_snapshot":
-			s.handlePrepareSnapshot(conn, req)
-		case "sync_filesystems":
-			s.handleSyncFilesystems(conn, req)
-		case "freeze_filesystems":
-			s.handleFreezeFilesystems(conn, req)
-		case "thaw_filesystems":
-			s.handleThawFilesystems(conn, req)
-		case "snapshot_ready":
-			s.handleSnapshotReady(conn, req)
-		default:
-			s.writeError(conn, 400, "unknown kind")
+		case modeControl:
+			// Parse JSON control message.
+			var req map[string]any
+			if err := json.Unmarshal(payload, &req); err != nil {
+				continue
+			}
+
+			kind, _ := req["kind"].(string)
+			switch kind {
+			case "protocol":
+				s.handleProtocol(conn, req)
+			case "health":
+				s.handleHealth(conn)
+			case "shutdown":
+				s.handleShutdown(conn)
+				return
+			case "execute":
+				s.handleExecute(conn, req)
+			case "cancel":
+				s.handleCancel(conn, req)
+			case "status":
+				s.handleStatus(conn, req)
+			case "upload_project":
+				s.handleUploadProject(conn, req, &mode, &projectID, &workspaceDir, &tarBuf)
+			case "upload_complete":
+				// Should not arrive outside tar mode; ignore.
+			case "download_file":
+				s.handleDownloadFile(conn, req)
+			case "prepare_snapshot":
+				s.handlePrepareSnapshot(conn, req)
+			case "sync_filesystems":
+				s.handleSyncFilesystems(conn, req)
+			case "freeze_filesystems":
+				s.handleFreezeFilesystems(conn, req)
+			case "thaw_filesystems":
+				s.handleThawFilesystems(conn, req)
+			case "snapshot_ready":
+				s.handleSnapshotReady(conn, req)
+			default:
+				s.writeError(conn, 400, "unknown kind")
+			}
 		}
 	}
 }
@@ -292,6 +360,90 @@ func (s *Server) handleExecute(conn net.Conn, req map[string]any) {
 		// Host disconnected; cancel the process.
 		_ = s.procManager.Cancel(execID)
 	}
+}
+
+// handleUploadProject begins receiving a tar archive for the given project.
+// After this call, the connection switches to tar-receiving mode; raw frames
+// are accumulated until upload_complete is received.
+func (s *Server) handleUploadProject(conn net.Conn, req map[string]any,
+	mode *connMode, projectID, workspaceDir *string, tarBuf *[]byte,
+) {
+	id, _ := req["project_id"].(string)
+	dir, _ := req["workspace_dir"].(string)
+	if id == "" {
+		s.writeError(conn, 400, "project_id is required")
+		return
+	}
+	if dir == "" {
+		s.writeError(conn, 400, "workspace_dir is required")
+		return
+	}
+
+	*projectID = id
+	*workspaceDir = dir
+	*tarBuf = nil
+	*mode = modeReceivingTar
+
+	s.writeJSON(conn, map[string]any{
+		"kind":       "upload_started",
+		"project_id": id,
+		"status":     "ready",
+	})
+}
+
+// handleDownloadFile reads a file from the workspace and streams it back to
+// the host as raw binary frames, followed by download_complete.
+func (s *Server) handleDownloadFile(conn net.Conn, req map[string]any) {
+	id, _ := req["project_id"].(string)
+	path, _ := req["path"].(string)
+	workspaceDir, _ := req["workspace_dir"].(string)
+	if id == "" {
+		s.writeError(conn, 400, "project_id is required")
+		return
+	}
+	if path == "" {
+		s.writeError(conn, 400, "path is required")
+		return
+	}
+	if workspaceDir == "" {
+		workspaceDir = filepathWorkspaceDir(id)
+	}
+
+	data, err := readFileFromWorkspace(workspaceDir, path, s.limits)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.writeError(conn, 404, fmt.Sprintf("file not found: %s", path))
+		} else {
+			s.writeError(conn, 500, err.Error())
+		}
+		return
+	}
+
+	// Send file data in frames.
+	const frameSize = 64 * 1024
+	for off := 0; off < len(data); off += frameSize {
+		end := off + frameSize
+		if end > len(data) {
+			end = len(data)
+		}
+		if err := writeFull(conn, data[off:end]); err != nil {
+			log.Printf("download write: %v", err)
+			return
+		}
+	}
+
+	// Signal completion.
+	s.writeJSON(conn, map[string]any{
+		"kind":       "download_complete",
+		"project_id": id,
+		"path":       path,
+		"status":     "ok",
+	})
+}
+
+// filepathWorkspaceDir returns the guest workspace directory for a project.
+func filepathWorkspaceDir(projectID string) string {
+	return filepath.Join("/tmp/bunn-workspace", projectID)
 }
 
 // streamOutput reads from a reader and sends execution_output messages.

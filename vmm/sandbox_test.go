@@ -1,6 +1,7 @@
 package vmm
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -276,3 +277,158 @@ func TestSandboxExecuteSendsCorrectRequest(t *testing.T) {
 	require.Equal(t, "/tmp", parsed["working_dir"])
 	require.Equal(t, float64(5), parsed["timeout_seconds"])
 }
+
+func TestValidateProject(t *testing.T) {
+	t.Run("valid project", func(t *testing.T) {
+		p := &Project{
+			ID:   "test-proj",
+			Files: map[string][]byte{
+				"main.go":  []byte("package main\n"),
+				"go.mod":   []byte("module test\n"),
+			},
+		}
+		require.NoError(t, validateProject(p))
+	})
+
+	t.Run("nil project rejected", func(t *testing.T) {
+		require.Error(t, validateProject(nil))
+	})
+
+	t.Run("empty id rejected", func(t *testing.T) {
+		p := &Project{Files: map[string][]byte{"main.go": []byte("x")}}
+		require.Error(t, validateProject(p))
+	})
+
+	t.Run("no files rejected", func(t *testing.T) {
+		p := &Project{ID: "test-proj"}
+		require.Error(t, validateProject(p))
+	})
+
+	t.Run("too many files rejected", func(t *testing.T) {
+		files := make(map[string][]byte, MaxProjectFiles+1)
+		for i := 0; i <= MaxProjectFiles; i++ {
+			files[string(rune('a'+i))+".txt"] = []byte("x")
+		}
+		p := &Project{ID: "test-proj", Files: files}
+		require.Error(t, validateProject(p))
+	})
+
+	t.Run("absolute path rejected", func(t *testing.T) {
+		p := &Project{
+			ID:   "test-proj",
+			Files: map[string][]byte{"/etc/passwd": []byte("x")},
+		}
+		require.Error(t, validateProject(p))
+	})
+
+	t.Run("path traversal rejected", func(t *testing.T) {
+		p := &Project{
+			ID:   "test-proj",
+			Files: map[string][]byte{"../secret.txt": []byte("x")},
+		}
+		require.Error(t, validateProject(p))
+	})
+
+	t.Run("oversized project rejected", func(t *testing.T) {
+		p := &Project{
+			ID:   "test-proj",
+			Files: map[string][]byte{
+				"big.txt": bytes.Repeat([]byte("x"), MaxProjectSize+1),
+			},
+		}
+		require.Error(t, validateProject(p))
+	})
+
+	t.Run("oversized individual file rejected", func(t *testing.T) {
+		p := &Project{
+			ID:   "test-proj",
+			Files: map[string][]byte{
+				"big.txt": bytes.Repeat([]byte("x"), MaxStdinSize+1),
+			},
+		}
+		require.Error(t, validateProject(p))
+	})
+}
+
+func TestValidateProjectPathHost(t *testing.T) {
+	t.Run("valid paths", func(t *testing.T) {
+		require.NoError(t, validateProjectPath("main.go"))
+		require.NoError(t, validateProjectPath("dir/subdir/file.go"))
+		require.NoError(t, validateProjectPath("config/app.yaml"))
+	})
+
+	t.Run("empty path rejected", func(t *testing.T) {
+		require.Error(t, validateProjectPath(""))
+	})
+
+	t.Run("absolute path rejected", func(t *testing.T) {
+		require.Error(t, validateProjectPath("/etc/passwd"))
+	})
+
+	t.Run("dot-dot traversal rejected", func(t *testing.T) {
+		require.Error(t, validateProjectPath("../etc/passwd"))
+		require.Error(t, validateProjectPath("dir/../../etc/passwd"))
+		require.Error(t, validateProjectPath(".."))
+	})
+}
+
+func TestProjectToTar(t *testing.T) {
+	p := &Project{
+		ID:   "test-proj",
+		Files: map[string][]byte{
+			"main.go":  []byte("package main\n"),
+			"go.mod":   []byte("module test\n"),
+			"nested/dir/server.go": []byte("package server\n"),
+		},
+		DirPerm:  0o750,
+		FilePerm: 0o640,
+	}
+
+	tarBuf, err := projectToTar(p)
+	require.NoError(t, err)
+	require.NotEmpty(t, tarBuf)
+
+	// Verify the tar can be read back.
+	tr := tar.NewReader(bytes.NewReader(tarBuf))
+	found := make(map[string]bool)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		found[hdr.Name] = true
+
+		// Verify permissions.
+		if hdr.Typeflag == tar.TypeDir {
+			require.Equal(t, int64(0o750), hdr.Mode)
+		} else if hdr.Typeflag == tar.TypeReg {
+			require.Equal(t, int64(0o640), hdr.Mode)
+		}
+	}
+
+	require.True(t, found["main.go"])
+	require.True(t, found["go.mod"])
+	require.True(t, found["nested/dir/server.go"])
+	require.True(t, found["nested"])
+	require.True(t, found["nested/dir"])
+}
+
+func TestProjectToTarEmptyFile(t *testing.T) {
+	p := &Project{
+		ID:   "test-proj",
+		Files: map[string][]byte{
+			"empty.txt": []byte{},
+		},
+	}
+
+	tarBuf, err := projectToTar(p)
+	require.NoError(t, err)
+
+	tr := tar.NewReader(bytes.NewReader(tarBuf))
+	hdr, err := tr.Next()
+	require.NoError(t, err)
+	require.Equal(t, "empty.txt", hdr.Name)
+	require.Equal(t, int64(0), hdr.Size)
+}
+
