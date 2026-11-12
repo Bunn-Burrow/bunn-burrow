@@ -19,6 +19,7 @@ const (
 	ResourceTypeSnapshot ResourceType = "snapshot"
 	ResourceTypeVM       ResourceType = "vm"
 	ResourceTypeVolume   ResourceType = "volume"
+	ResourceTypeImage    ResourceType = "image"
 )
 
 // LifecycleState describes the lifecycle state of a storage resource.

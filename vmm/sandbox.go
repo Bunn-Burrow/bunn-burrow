@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/omkar/sandbox/internal/storage"
+	"github.com/omkar/sandbox/internal/template"
+	vmimage "github.com/omkar/sandbox/internal/vmimage"
 )
 
 // MaxStdinSize is the maximum size of stdin data that can be sent with an
@@ -107,6 +109,8 @@ type Sandbox struct {
 	vm   *VM
 	cfg  Config
 	done bool // Close has been called
+	// TemplateManager manages templates for this sandbox.
+	TemplateManager *template.TemplateManager
 }
 
 // NewSandbox creates a sandboxed VM in the Created state. It validates config,
@@ -292,12 +296,16 @@ func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, s
 				}
 				switch stream {
 				case "stdout":
-					if _, werr := stdout.Write([]byte(data)); werr != nil {
-						return exitCode, werr
+					if stdout != nil {
+						if _, werr := stdout.Write([]byte(data)); werr != nil {
+							return exitCode, werr
+						}
 					}
 				case "stderr":
-					if _, werr := stderr.Write([]byte(data)); werr != nil {
-						return exitCode, werr
+					if stderr != nil {
+						if _, werr := stderr.Write([]byte(data)); werr != nil {
+							return exitCode, werr
+						}
 					}
 				}
 			case "execution_finished":
@@ -712,6 +720,235 @@ func (s *Sandbox) DetachVolume(volumeID string) error {
 	}
 
 	return vm.VolumeManager.DetachVolume(volumeID)
+}
+
+// Image management API.
+
+// CreateImage creates a new persistent image from a local file. The image is
+// immutable once created and can be referenced by templates or used to boot
+// VMs directly.
+func (s *Sandbox) CreateImage(ctx context.Context, id, name, version, sourceFile string, format string, sizeBytes int64, metadata, labels map[string]string) (*vmimage.Image, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.ImageManager == nil {
+		return nil, errors.New("image manager not configured")
+	}
+
+	var imgFormat vmimage.ImageFormat
+	switch format {
+	case "qcow2":
+		imgFormat = vmimage.ImageFormatQCOW2
+	case "ext4":
+		imgFormat = vmimage.ImageFormatExt4
+	case "raw":
+		imgFormat = vmimage.ImageFormatRaw
+	default:
+		return nil, fmt.Errorf("unsupported image format %q", format)
+	}
+
+	return vm.ImageManager.CreateImage(id, name, version, sourceFile, imgFormat, sizeBytes, metadata, labels)
+}
+
+// ImportImage imports an existing local file as an image.
+func (s *Sandbox) ImportImage(ctx context.Context, id, name, version, sourceFile string, format string, metadata, labels map[string]string) (*vmimage.Image, error) {
+	return s.CreateImage(ctx, id, name, version, sourceFile, format, 0, metadata, labels)
+}
+
+// InspectImage returns the image with the given ID, or nil if not found.
+func (s *Sandbox) InspectImage(id string) (*vmimage.Image, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.ImageManager == nil {
+		return nil, errors.New("image manager not configured")
+	}
+
+	return vm.ImageManager.InspectImage(id)
+}
+
+// ListImages returns all known images.
+func (s *Sandbox) ListImages() ([]*vmimage.Image, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.ImageManager == nil {
+		return nil, errors.New("image manager not configured")
+	}
+
+	return vm.ImageManager.ListImages()
+}
+
+// DeleteImage deletes an image. It fails if the image is referenced by any
+// template.
+func (s *Sandbox) DeleteImage(id string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.ImageManager == nil {
+		return errors.New("image manager not configured")
+	}
+
+	return vm.ImageManager.DeleteImage(id)
+}
+
+// Template management API.
+
+// CreateTemplate registers a new template. If ImageID is set, the referenced
+// image must exist and be active.
+func (s *Sandbox) CreateTemplate(tmpl *template.Template) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return errors.New("template manager not configured")
+	}
+
+	return vm.TemplateManager.Create(tmpl)
+}
+
+// InspectTemplate returns the template with the given ID, or nil if not found.
+func (s *Sandbox) InspectTemplate(id string) *template.Template {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return nil
+	}
+
+	return vm.TemplateManager.Get(id)
+}
+
+// ListTemplates returns all registered templates.
+func (s *Sandbox) ListTemplates() ([]*template.Template, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return nil, errors.New("template manager not configured")
+	}
+
+	return vm.TemplateManager.ListTemplates()
+}
+
+// ValidateTemplate validates a template's image reference and rootfs checksum.
+func (s *Sandbox) ValidateTemplate(id string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return errors.New("template manager not configured")
+	}
+
+	return vm.TemplateManager.Validate(id)
+}
+
+// DeleteTemplate removes a template. Fails if any VM currently uses it.
+func (s *Sandbox) DeleteTemplate(id string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return errors.New("template manager not configured")
+	}
+
+	return vm.TemplateManager.Delete(id)
+}
+
+// AcquireTemplate increments a template's in-use reference count.
+func (s *Sandbox) AcquireTemplate(id string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return errors.New("template manager not configured")
+	}
+
+	return vm.TemplateManager.Acquire(id)
+}
+
+// ReleaseTemplate decrements a template's in-use reference count.
+func (s *Sandbox) ReleaseTemplate(id string) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return
+	}
+
+	vm.TemplateManager.Release(id)
+}
+
+// ResolveTemplateDefaults returns the execution defaults from a template.
+func (s *Sandbox) ResolveTemplateDefaults(id string) (*template.TemplateDefaults, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.TemplateManager == nil {
+		return nil, errors.New("template manager not configured")
+	}
+
+	return vm.TemplateManager.ResolveDefaults(id)
 }
 
 // SessionConfig describes the configuration for starting an interactive PTY session.

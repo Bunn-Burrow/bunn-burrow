@@ -18,6 +18,7 @@ import (
 	"github.com/omkar/sandbox/internal/network"
 	"github.com/omkar/sandbox/internal/storage"
 	"github.com/omkar/sandbox/internal/template"
+	vmimage "github.com/omkar/sandbox/internal/vmimage"
 )
 
 // VM owns a Firecracker microVM instance: its lifecycle state, process handle,
@@ -54,6 +55,12 @@ type VM struct {
 	// VolumeManager manages persistent volumes for VM attachment. Optional;
 	// when nil, volume attach/detach is unavailable.
 	VolumeManager *storage.VolumeManager
+	// ImageManager resolves images for VM boot. Optional; when nil, image-based
+	// VM creation is unavailable.
+	ImageManager *vmimage.ImageManager
+	// TemplateManager manages templates for this VM. Optional; when nil,
+	// template-based VM creation is unavailable.
+	TemplateManager *template.TemplateManager
 	// NetworkManager manages TAP/IPAM/firewall resources for VMs. Optional;
 	// when nil and Network is set, the VM creates its own manager and owns it.
 	NetworkManager *network.Manager
@@ -70,6 +77,9 @@ type VM struct {
 	// nbdDevice is the NBD device path (e.g. /dev/nbd0) assigned to this VM's
 	// overlay. It is cleared once the NBD mapping is released.
 	nbdDevice string
+	// imageNBDDevice is the NBD device path for image-based boot. Cleared on
+	// stop/destroy.
+	imageNBDDevice string
 	// attachedVolumes tracks NBD device paths for volumes attached to this VM.
 	// They are detached on Stop/Destroy.
 	attachedVolumes []string
@@ -117,6 +127,16 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 	// Use the configured volume manager if provided.
 	if cfg.VolumeManager != nil {
 		vm.VolumeManager = cfg.VolumeManager
+	}
+
+	// Use the configured image manager if provided.
+	if cfg.ImageManager != nil {
+		vm.ImageManager = cfg.ImageManager
+	}
+
+	// Use the configured template manager if provided.
+	if cfg.TemplateManager != nil {
+		vm.TemplateManager = cfg.TemplateManager
 	}
 
 	// Create the VM's private working directory so Firecracker can place its
@@ -188,6 +208,9 @@ func (vm *VM) Start(ctx context.Context) error {
 	// volumesAttached tracks whether volumes were attached so they can be
 	// detached on failure.
 	var volumesAttached bool
+	// imageAttached tracks whether an image NBD device was mapped so it can
+	// be unmapped on failure.
+	var imageAttached bool
 	defer func() {
 		if layerCreated && vm.State() != StateRunning {
 			vm.removeWritableLayer()
@@ -202,7 +225,18 @@ func (vm *VM) Start(ctx context.Context) error {
 				vm.logger.WithError(err).Warn("detach volumes on startup failure")
 			}
 		}
+		if imageAttached && vm.State() != StateRunning {
+			vm.unmapImage()
+		}
 	}()
+
+	if vm.cfg.ImageID != "" {
+		if err := vm.resolveImage(ctx); err != nil {
+			vm.sm.TransitionTo(StateFailed)
+			return err
+		}
+		imageAttached = true
+	}
 
 	if vm.cfg.TemplateID != "" {
 		if err := vm.resolveTemplate(ctx); err != nil {
@@ -737,6 +771,8 @@ func (vm *VM) Stop(ctx context.Context) error {
 			vm.logger.WithError(err).Warn("volume detach during stop")
 		}
 
+		vm.unmapImage()
+
 		if err := vm.sm.Transition(StateStopping, StateStopped); err != nil {
 			return fmt.Errorf("finalize stop: %w", err)
 		}
@@ -814,6 +850,7 @@ func (vm *VM) Destroy(ctx context.Context) error {
 	}
 
 	vm.removeWritableLayer()
+	vm.unmapImage()
 
 	if err := vm.shutDownNetworkMgr(); err != nil {
 		errs = append(errs, fmt.Errorf("shutdown network manager: %w", err))
@@ -993,6 +1030,62 @@ func (vm *VM) removeWritableLayer() {
 	if vm.TemplateStore != nil {
 		// The template ID is still in cfg.TemplateID at this point.
 		vm.TemplateStore.Release(vm.cfg.TemplateID)
+	}
+}
+
+// resolveImage resolves the configured image, maps its qcow2 file to an NBD
+// block device, and sets vm.cfg.RootFS to the device path. The image is used
+// as a read-only root device; VM writes go to an overlay if configured.
+func (vm *VM) resolveImage(ctx context.Context) error {
+	if vm.ImageManager == nil {
+		return fmt.Errorf("image id %q set but no image manager configured", vm.cfg.ImageID)
+	}
+	if vm.NBDMgr == nil {
+		return fmt.Errorf("image id %q set but no NBD manager configured", vm.cfg.ImageID)
+	}
+
+	img, err := vm.ImageManager.InspectImage(vm.cfg.ImageID)
+	if err != nil {
+		return fmt.Errorf("inspect image %q: %w", vm.cfg.ImageID, err)
+	}
+	if img == nil {
+		return fmt.Errorf("image %q not found", vm.cfg.ImageID)
+	}
+	if img.State != vmimage.ImageStateActive {
+		return fmt.Errorf("image %q is not active (state=%s)", vm.cfg.ImageID, img.State)
+	}
+
+	// Map the image qcow2 to an NBD block device.
+	nbdDevice, err := vm.NBDMgr.Map(ctx, img.Path, vm.id)
+	if err != nil {
+		return fmt.Errorf("map image to NBD device: %w", err)
+	}
+
+	vm.mu.Lock()
+	vm.imageNBDDevice = nbdDevice
+	vm.cfg.RootFS = nbdDevice
+	vm.mu.Unlock()
+
+	vm.logger.Info("image resolved",
+		map[string]any{"image_id": vm.cfg.ImageID, "image_path": img.Path, "nbd_device": nbdDevice})
+
+	return nil
+}
+
+// unmapImage unmaps the image NBD device and clears the RootFS reference.
+func (vm *VM) unmapImage() {
+	vm.mu.Lock()
+	nbdDevice := vm.imageNBDDevice
+	vm.imageNBDDevice = ""
+	vm.cfg.RootFS = ""
+	vm.mu.Unlock()
+
+	if nbdDevice == "" {
+		return
+	}
+
+	if vm.NBDMgr != nil {
+		_ = vm.NBDMgr.Unmap(vm.id)
 	}
 }
 

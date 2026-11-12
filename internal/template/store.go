@@ -52,87 +52,90 @@ func (s *Store) EnsureDirs() error {
 	return nil
 }
 
-// Create registers sourceRootfsPath as an immutable template. The rootfs is
-// copied into the template store, checksummed, and marked read-only. The source
-// rootfs is left untouched. Returns an error if id already exists.
-func (s *Store) Create(id, name, baseImage, sourceRootfsPath, rootfsFormat, architecture, version string) (*Template, error) {
-	if id == "" {
-		return nil, fmt.Errorf("template id is required")
+// Create registers a template. If ImageID is set, the template references an
+// existing image (the image must already be registered with an ImageManager;
+// this store does not validate the reference). If ImageID is empty, the source
+// rootfs is copied into the template store as before (backward compatible).
+// Returns an error if id already exists.
+func (s *Store) Create(tmpl *Template) error {
+	if tmpl.ID == "" {
+		return fmt.Errorf("template id is required")
 	}
-	if filepath.Base(id) != id {
-		return nil, fmt.Errorf("template id %q must not contain path separators", id)
+	if filepath.Base(tmpl.ID) != tmpl.ID {
+		return fmt.Errorf("template id %q must not contain path separators", tmpl.ID)
 	}
 
 	s.mu.Lock()
-	if s.Get(id) != nil {
+	if _, exists := s.templates[tmpl.ID]; exists {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("template %q already exists", id)
+		return fmt.Errorf("template %q already exists", tmpl.ID)
 	}
 	s.mu.Unlock()
 
-	if _, err := os.Stat(sourceRootfsPath); err != nil {
-		return nil, fmt.Errorf("source rootfs not statable: %w", err)
+	now := time.Now()
+	if tmpl.CreatedAt.IsZero() {
+		tmpl.CreatedAt = now
 	}
 
-	tmplRootfsDir := filepath.Join(s.dir, rootfsDir, id)
-	if err := os.MkdirAll(tmplRootfsDir, 0o750); err != nil {
-		return nil, fmt.Errorf("create template rootfs dir: %w", err)
-	}
+	// If no image reference, copy the source rootfs (backward compatible).
+	if tmpl.ImageID == "" {
+		if tmpl.RootfsPath == "" {
+			return fmt.Errorf("template %q has no image_id and no rootfs_path", tmpl.ID)
+		}
+		if _, err := os.Stat(tmpl.RootfsPath); err != nil {
+			return fmt.Errorf("source rootfs not statable: %w", err)
+		}
 
-	// Copy the source rootfs to a temp file then rename atomically so a failed
-	// copy never leaves a partial template image behind.
-	tmpPath := filepath.Join(tmplRootfsDir, "rootfs.ext4.tmp")
-	finalPath := filepath.Join(tmplRootfsDir, "rootfs.ext4")
-	if err := copyFileAtomic(sourceRootfsPath, tmpPath, finalPath); err != nil {
-		os.Remove(tmpPath)
-		return nil, fmt.Errorf("copy rootfs: %w", err)
-	}
+		tmplRootfsDir := filepath.Join(s.dir, rootfsDir, tmpl.ID)
+		if err := os.MkdirAll(tmplRootfsDir, 0o750); err != nil {
+			return fmt.Errorf("create template rootfs dir: %w", err)
+		}
 
-	// Make the template rootfs read-only. This is defense in depth, not the
-	// sole security boundary: VMs never receive write access to this file.
-	if err := os.Chmod(finalPath, 0o444); err != nil {
-		os.Remove(finalPath)
-		return nil, fmt.Errorf("chmod rootfs read-only: %w", err)
-	}
+		tmpPath := filepath.Join(tmplRootfsDir, "rootfs.ext4.tmp")
+		finalPath := filepath.Join(tmplRootfsDir, "rootfs.ext4")
+		if err := copyFileAtomic(tmpl.RootfsPath, tmpPath, finalPath); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("copy rootfs: %w", err)
+		}
 
-	// Compute the checksum of the final, immutable rootfs.
-	checksum, err := sha256File(finalPath)
-	if err != nil {
-		os.Remove(finalPath)
-		return nil, fmt.Errorf("checksum rootfs: %w", err)
-	}
+		if err := os.Chmod(finalPath, 0o444); err != nil {
+			os.Remove(finalPath)
+			return fmt.Errorf("chmod rootfs read-only: %w", err)
+		}
 
-	tmpl := &Template{
-		ID:             id,
-		Name:           name,
-		BaseImage:      baseImage,
-		RootfsPath:     finalPath,
-		RootfsFormat:   rootfsFormat,
-		Architecture:   architecture,
-		CreatedAt:      time.Now(),
-		RootfsChecksum: checksum,
-		Version:        version,
-		Immutable:      true,
+		checksum, err := sha256File(finalPath)
+		if err != nil {
+			os.Remove(finalPath)
+			return fmt.Errorf("checksum rootfs: %w", err)
+		}
+
+		tmpl.RootfsPath = finalPath
+		tmpl.RootfsChecksum = checksum
+		if tmpl.RootfsFormat == "" {
+			tmpl.RootfsFormat = "ext4"
+		}
+		tmpl.Immutable = true
 	}
 
 	// Persist metadata atomically.
 	metadataDirPath := filepath.Join(s.dir, metadataDir)
 	if err := os.MkdirAll(metadataDirPath, 0o750); err != nil {
-		os.Remove(finalPath)
-		return nil, fmt.Errorf("create metadata dir: %w", err)
+		return fmt.Errorf("create metadata dir: %w", err)
 	}
-	metaTmp := filepath.Join(metadataDirPath, id+".json.tmp")
-	metaFinal := filepath.Join(metadataDirPath, id+".json")
+	metaTmp := filepath.Join(metadataDirPath, tmpl.ID+".json.tmp")
+	metaFinal := filepath.Join(metadataDirPath, tmpl.ID+".json")
 	if err := writeJSONAtomically(metaTmp, metaFinal, tmpl); err != nil {
-		os.Remove(finalPath)
-		return nil, fmt.Errorf("write metadata: %w", err)
+		if tmpl.ImageID == "" {
+			os.Remove(filepath.Join(s.dir, rootfsDir, tmpl.ID, "rootfs.ext4"))
+		}
+		return fmt.Errorf("write metadata: %w", err)
 	}
 
 	s.mu.Lock()
-	s.templates[id] = tmpl
+	s.templates[tmpl.ID] = tmpl
 	s.mu.Unlock()
 
-	return tmpl, nil
+	return nil
 }
 
 // Get returns the template metadata for id, or nil if not found. Metadata is
@@ -220,7 +223,7 @@ func (s *Store) Delete(id string) error {
 
 	tmpl := s.Get(id)
 	var errs []error
-	if tmpl != nil {
+	if tmpl != nil && tmpl.RootfsPath != "" {
 		if err := os.RemoveAll(filepath.Dir(tmpl.RootfsPath)); err != nil {
 			errs = append(errs, fmt.Errorf("remove rootfs: %w", err))
 		}

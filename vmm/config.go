@@ -10,6 +10,8 @@ import (
 
 	"github.com/omkar/sandbox/internal/network"
 	"github.com/omkar/sandbox/internal/storage"
+	"github.com/omkar/sandbox/internal/template"
+	vmimage "github.com/omkar/sandbox/internal/vmimage"
 )
 
 // Config holds the configuration required to create and start a Firecracker
@@ -62,6 +64,12 @@ type Config struct {
 	// rootfs creation is used (backward compatible).
 	TemplateID string
 
+	// ImageID optionally references a registered image to use as the VM's
+	// rootfs source. When set, the image's qcow2 file is used as the root
+	// device and RootFS need not be set directly. When empty, direct rootfs
+	// creation is used (backward compatible).
+	ImageID string
+
 	// Network optionally configures networking for the VM. When nil, the VM
 	// has no network interface (vsock only).
 	Network *NetworkConfig
@@ -73,6 +81,14 @@ type Config struct {
 	// VolumeManager manages persistent volumes for VM attachment. Optional;
 	// when nil, volume attach/detach is unavailable.
 	VolumeManager *storage.VolumeManager
+
+	// ImageManager resolves images for VM boot. Optional; when nil, image-based
+	// VM creation is unavailable.
+	ImageManager *vmimage.ImageManager
+
+	// TemplateManager manages templates for this VM. Optional; when nil,
+	// template-based VM creation is unavailable.
+	TemplateManager *template.TemplateManager
 
 	// Volumes lists volumes to attach to this VM at startup. Each volume is
 	// attached before guest execution and detached on VM stop/destroy.
