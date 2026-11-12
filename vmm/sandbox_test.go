@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -430,5 +432,174 @@ func TestProjectToTarEmptyFile(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "empty.txt", hdr.Name)
 	require.Equal(t, int64(0), hdr.Size)
+}
+
+func TestSessionStartRequest(t *testing.T) {
+	conn := &fakeConn{}
+	conn.ServeFrame(`{"kind":"session_started","session_id":"sess-1","pid":123}`)
+
+	ctx := context.Background()
+	sess, err := StartSessionTest(ctx, conn, SessionConfig{
+		Cmd:     "/bin/sh",
+		Args:    []string{"-c", "echo hi"},
+		Env:     []string{"FOO=bar"},
+		Dir:     "/tmp",
+		Rows:    24,
+		Cols:    80,
+		Timeout: 30 * time.Second,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	req := conn.lastRequest()
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(req), &parsed))
+	require.Equal(t, "session_start", parsed["kind"])
+	require.Equal(t, "/bin/sh", parsed["command"])
+	require.Equal(t, []any{"-c", "echo hi"}, parsed["args"])
+	require.Equal(t, []any{"FOO=bar"}, parsed["env"])
+	require.Equal(t, "/tmp", parsed["working_dir"])
+	require.Equal(t, float64(24), parsed["rows"])
+	require.Equal(t, float64(80), parsed["cols"])
+	require.Equal(t, float64(30), parsed["timeout_seconds"])
+	require.Equal(t, sess.sessionID, parsed["session_id"])
+
+	_ = sess.Close()
+}
+
+func TestSessionSendInput(t *testing.T) {
+	conn := &fakeConn{}
+	conn.ServeFrame(`{"kind":"session_started","session_id":"sess-1","pid":123}`)
+
+	ctx := context.Background()
+	sess, err := StartSessionTest(ctx, conn, SessionConfig{
+		Cmd: "cat",
+	})
+	require.NoError(t, err)
+
+	data := []byte("hello\n")
+	require.NoError(t, sess.SendInput(data))
+
+	req := conn.lastRequest()
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(req), &parsed))
+	require.Equal(t, "session_input", parsed["kind"])
+	require.Equal(t, sess.sessionID, parsed["session_id"])
+	require.Equal(t, "hello\n", parsed["data"])
+
+	_ = sess.Close()
+}
+
+func TestSessionResize(t *testing.T) {
+	conn := &fakeConn{}
+	conn.ServeFrame(`{"kind":"session_started","session_id":"sess-1","pid":123}`)
+
+	ctx := context.Background()
+	sess, err := StartSessionTest(ctx, conn, SessionConfig{Cmd: "cat"})
+	require.NoError(t, err)
+
+	require.NoError(t, sess.Resize(40, 120))
+
+	req := conn.lastRequest()
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(req), &parsed))
+	require.Equal(t, "session_resize", parsed["kind"])
+	require.Equal(t, sess.sessionID, parsed["session_id"])
+	require.Equal(t, float64(40), parsed["rows"])
+	require.Equal(t, float64(120), parsed["cols"])
+
+	_ = sess.Close()
+}
+
+func TestNewSessionIDUnique(t *testing.T) {
+	id1 := newSessionID()
+	id2 := newSessionID()
+	require.NotEqual(t, id1, id2)
+	require.True(t, strings.HasPrefix(id1, "sess-"))
+	require.True(t, strings.HasPrefix(id2, "sess-"))
+}
+
+// StartSessionTest is a test helper that simulates Sandbox.StartSession using a
+// fake connection. It sends session_start, reads session_started, and returns
+// a Session for testing the session API without a real VM.
+func StartSessionTest(ctx context.Context, conn *fakeConn, cfg SessionConfig) (*Session, error) {
+	sessionID := newSessionID()
+
+	req := map[string]any{
+		"kind":           "session_start",
+		"session_id":     sessionID,
+		"command":        cfg.Cmd,
+		"args":           cfg.Args,
+		"env":            cfg.Env,
+		"working_dir":    cfg.Dir,
+		"rows":           cfg.Rows,
+		"cols":           cfg.Cols,
+		"timeout_seconds": cfg.Timeout.Seconds(),
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	if err := writeFull(conn, payload); err != nil {
+		return nil, err
+	}
+
+	msgCh := make(chan decodeResult, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			frameLen := binary.BigEndian.Uint32(lenBuf[:])
+			if frameLen == 0 || frameLen > 1<<20 {
+				msgCh <- decodeResult{err: fmt.Errorf("invalid frame length: %d", frameLen)}
+				return
+			}
+			payload := make([]byte, frameLen)
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			var msg map[string]any
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			msgCh <- decodeResult{msg: msg}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res, ok := <-msgCh:
+		if !ok {
+			return nil, errors.New("connection closed")
+		}
+		if res.err != nil {
+			return nil, res.err
+		}
+		if kind, _ := res.msg["kind"].(string); kind != "session_started" {
+			return nil, fmt.Errorf("unexpected response: %v", res.msg)
+		}
+		sess := &Session{
+			conn:       conn,
+			sessionID:  sessionID,
+			done:       make(chan struct{}),
+			outputCh:   make(chan []byte, 128),
+			errCh:      make(chan error, 1),
+		}
+		go sess.readLoop(msgCh)
+		return sess, nil
+	}
 }
 

@@ -51,6 +51,9 @@ type VM struct {
 	// StorageManager tracks persistent storage resources for this VM.
 	// Optional; when nil, storage lifecycle tracking is disabled.
 	StorageManager *storage.StorageManager
+	// VolumeManager manages persistent volumes for VM attachment. Optional;
+	// when nil, volume attach/detach is unavailable.
+	VolumeManager *storage.VolumeManager
 	// NetworkManager manages TAP/IPAM/firewall resources for VMs. Optional;
 	// when nil and Network is set, the VM creates its own manager and owns it.
 	NetworkManager *network.Manager
@@ -67,6 +70,9 @@ type VM struct {
 	// nbdDevice is the NBD device path (e.g. /dev/nbd0) assigned to this VM's
 	// overlay. It is cleared once the NBD mapping is released.
 	nbdDevice string
+	// attachedVolumes tracks NBD device paths for volumes attached to this VM.
+	// They are detached on Stop/Destroy.
+	attachedVolumes []string
 }
 
 // New creates a VM in the Created state. It validates configuration, allocates
@@ -106,6 +112,11 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 		}
 		vm.NetworkManager = mgr
 		vm.ownNetworkMgr = true
+	}
+
+	// Use the configured volume manager if provided.
+	if cfg.VolumeManager != nil {
+		vm.VolumeManager = cfg.VolumeManager
 	}
 
 	// Create the VM's private working directory so Firecracker can place its
@@ -174,6 +185,9 @@ func (vm *VM) Start(ctx context.Context) error {
 	// networkAllocated tracks whether network resources were allocated so they
 	// can be released on failure.
 	var networkAllocated bool
+	// volumesAttached tracks whether volumes were attached so they can be
+	// detached on failure.
+	var volumesAttached bool
 	defer func() {
 		if layerCreated && vm.State() != StateRunning {
 			vm.removeWritableLayer()
@@ -181,6 +195,11 @@ func (vm *VM) Start(ctx context.Context) error {
 		if networkAllocated && vm.State() != StateRunning {
 			if err := vm.releaseNetwork(); err != nil {
 				vm.logger.WithError(err).Warn("release network on startup failure")
+			}
+		}
+		if volumesAttached && vm.State() != StateRunning {
+			if err := vm.detachVolumes(); err != nil {
+				vm.logger.WithError(err).Warn("detach volumes on startup failure")
 			}
 		}
 	}()
@@ -206,6 +225,15 @@ func (vm *VM) Start(ctx context.Context) error {
 		return fmt.Errorf("allocate network: %w", err)
 	}
 	networkAllocated = true
+
+	// Attach persistent volumes before device configuration so their NBD
+	// block devices are available when Firecracker configures drives.
+	if _, err := vm.attachVolumes(ctx); err != nil {
+		vm.stopProcLocked()
+		vm.sm.TransitionTo(StateFailed)
+		return fmt.Errorf("attach volumes: %w", err)
+	}
+	volumesAttached = true
 
 	if err := vm.configureDevices(ctx); err != nil {
 		vm.stopProcLocked()
@@ -328,13 +356,30 @@ func (vm *VM) configureDevices(ctx context.Context) error {
 		return err
 	}
 
+	// Attach persistent volumes as additional drives. Each volume's NBD device
+	// is exposed to the guest as a writable block device.
+	for i, devicePath := range vm.attachedVolumes {
+		driveID := fmt.Sprintf("vol-%d", i)
+		isReadOnly := false
+		if err := vm.api.PutGuestDriveByID(ctx, driveID, &models.Drive{
+			DriveID:      &driveID,
+			PathOnHost:   &devicePath,
+			IsRootDevice: boolPtr(false),
+			IsReadOnly:   &isReadOnly,
+			CacheType:    cacheTypePtr(models.DriveCacheTypeWriteback),
+			IoEngine:     ioEnginePtr(models.DriveIoEngineSync),
+		}); err != nil {
+			return fmt.Errorf("configure volume drive %s: %w", driveID, err)
+		}
+	}
+
 	// Attach the network interface if networking is configured. Firecracker
 	// expects the host to create the TAP device before this call.
 	if n := vm.network; n != nil {
 		if err := vm.api.PutGuestNetworkInterfaceByID(ctx, n.IfaceID, &models.NetworkInterface{
-			GuestMac:   n.MAC.String(),
+			GuestMac:    n.MAC.String(),
 			HostDevName: &n.TapDevice,
-			IfaceID:    &n.IfaceID,
+			IfaceID:     &n.IfaceID,
 		}); err != nil {
 			return fmt.Errorf("configure network interface: %w", err)
 		}
@@ -414,6 +459,78 @@ func (vm *VM) shutDownNetworkMgr() error {
 		return nil
 	}
 	return vm.NetworkManager.Shutdown()
+}
+
+// attachVolumes attaches all volumes listed in vm.cfg.Volumes to this VM.
+// It maps each volume's qcow2 image to an NBD block device via the VolumeManager.
+// Returns the list of NBD device paths that were attached.
+func (vm *VM) attachVolumes(ctx context.Context) ([]string, error) {
+	if vm.VolumeManager == nil || len(vm.cfg.Volumes) == 0 {
+		return nil, nil
+	}
+
+	var attached []string
+	for _, ref := range vm.cfg.Volumes {
+		devicePath, err := vm.VolumeManager.AttachVolume(ctx, ref.VolumeID, vm.id)
+		if err != nil {
+			// Detach any volumes already attached for this VM on failure.
+			for _, dev := range attached {
+				_ = vm.detachVolumeByDevice(dev)
+			}
+			return nil, fmt.Errorf("attach volume %q: %w", ref.VolumeID, err)
+		}
+		vm.attachedVolumes = append(vm.attachedVolumes, devicePath)
+		attached = append(attached, devicePath)
+		vm.logger.Info("volume attached",
+			map[string]any{"vm_id": vm.id, "volume_id": ref.VolumeID, "device": devicePath})
+	}
+	return attached, nil
+}
+
+// detachVolumes detaches all volumes currently attached to this VM.
+func (vm *VM) detachVolumes() error {
+	vm.mu.Lock()
+	volumes := append([]string(nil), vm.attachedVolumes...)
+	vm.attachedVolumes = nil
+	vm.mu.Unlock()
+
+	var errs []error
+	for _, devicePath := range volumes {
+		if err := vm.detachVolumeByDevice(devicePath); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+// detachVolumeByDevice detaches a volume by finding the volume ID associated
+// with the given NBD device path and calling VolumeManager.DetachVolume.
+func (vm *VM) detachVolumeByDevice(devicePath string) error {
+	if vm.VolumeManager == nil {
+		return nil
+	}
+
+	// Find the volume ID for this device by inspecting volumes.
+	// The VolumeManager doesn't have a reverse device->volume lookup, so we
+	// iterate through known volumes. For simplicity, we use the VM's ID to
+	// look up attached volumes via GetVolumeForVM.
+	vol, err := vm.VolumeManager.GetVolumeForVM(vm.id)
+	if err != nil {
+		return err
+	}
+	if vol == nil || vol.AttachedDevice != devicePath {
+		return nil // not our device or already detached
+	}
+	return vm.VolumeManager.DetachVolume(vol.ID)
+}
+
+// shutDownVolumeMgr is a no-op for now since VolumeManager is typically shared
+// and not owned by a single VM.
+func (vm *VM) shutDownVolumeMgr() error {
+	return nil
 }
 
 // waitForSocket waits for the Firecracker API socket to accept requests, bounded
@@ -616,6 +733,10 @@ func (vm *VM) Stop(ctx context.Context) error {
 			vm.logger.WithError(err).Warn("network release during stop")
 		}
 
+		if err := vm.detachVolumes(); err != nil {
+			vm.logger.WithError(err).Warn("volume detach during stop")
+		}
+
 		if err := vm.sm.Transition(StateStopping, StateStopped); err != nil {
 			return fmt.Errorf("finalize stop: %w", err)
 		}
@@ -684,6 +805,9 @@ func (vm *VM) Destroy(ctx context.Context) error {
 	}
 	if err := vm.releaseNetwork(); err != nil {
 		errs = append(errs, fmt.Errorf("release network: %w", err))
+	}
+	if err := vm.detachVolumes(); err != nil {
+		errs = append(errs, fmt.Errorf("detach volumes: %w", err))
 	}
 	if err := vm.removeOwnedArtifacts(); err != nil {
 		errs = append(errs, fmt.Errorf("remove artifacts: %w", err))
@@ -920,8 +1044,8 @@ func (vm *VM) destroy(ctx context.Context, force bool) error {
 
 // helpers
 
-func int64Ptr(v int64) *int64 { return &v }
-func boolPtr(v bool) *bool    { return &v }
+func int64Ptr(v int64) *int64    { return &v }
+func boolPtr(v bool) *bool       { return &v }
 func stringPtr(v string) *string { return &v }
 func vmStatePtr(v string) *string {
 	return &v

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/omkar/sandbox/internal/storage"
 )
 
 // MaxStdinSize is the maximum size of stdin data that can be sent with an
@@ -367,9 +370,9 @@ func (s *Sandbox) UploadProject(ctx context.Context, p *Project) error {
 
 	// Send upload_project control message.
 	req := map[string]any{
-		"kind":           "upload_project",
-		"project_id":     p.ID,
-		"workspace_dir":  workspaceDir,
+		"kind":          "upload_project",
+		"project_id":    p.ID,
+		"workspace_dir": workspaceDir,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -505,10 +508,10 @@ func (s *Sandbox) DownloadFile(ctx context.Context, projectID, path string, w io
 
 	// Send download_file control message.
 	req := map[string]any{
-		"kind":           "download_file",
-		"project_id":     projectID,
-		"path":           path,
-		"workspace_dir":  workspaceDir,
+		"kind":          "download_file",
+		"project_id":    projectID,
+		"path":          path,
+		"workspace_dir": workspaceDir,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -599,7 +602,603 @@ func (s *Sandbox) DownloadFile(ctx context.Context, projectID, path string, w io
 	}
 }
 
-// validateProject checks that a project is valid for upload.
+// Volume management API for persistent volumes.
+
+// CreateVolume creates a new persistent volume with the given ID and size.
+// If sizeBytes is 0, the configured default size is used. The volume survives
+// VM destruction and can be reattached to another VM.
+func (s *Sandbox) CreateVolume(ctx context.Context, volumeID string, sizeBytes int64, metadata, labels map[string]string) (*storage.Volume, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return nil, errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.CreateVolume(volumeID, sizeBytes, metadata, labels)
+}
+
+// InspectVolume returns the volume with the given ID, or nil if not found.
+func (s *Sandbox) InspectVolume(volumeID string) (*storage.Volume, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return nil, errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.InspectVolume(volumeID)
+}
+
+// ListVolumes returns all known volumes.
+func (s *Sandbox) ListVolumes() ([]*storage.Volume, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return nil, errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.ListVolumes()
+}
+
+// DeleteVolume deletes a volume. It fails if the volume is currently attached
+// to a VM.
+func (s *Sandbox) DeleteVolume(volumeID string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.DeleteVolume(volumeID)
+}
+
+// AttachVolume attaches a volume to this sandbox's VM. Returns the NBD device
+// path exposed to the guest.
+func (s *Sandbox) AttachVolume(ctx context.Context, volumeID string) (string, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return "", errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return "", errors.New("volume manager not configured")
+	}
+
+	if vm.State() != StateRunning {
+		return "", fmt.Errorf("sandbox VM not running (state=%s)", vm.State())
+	}
+
+	return vm.VolumeManager.AttachVolume(ctx, volumeID, vm.id)
+}
+
+// DetachVolume detaches a volume from this sandbox's VM.
+func (s *Sandbox) DetachVolume(volumeID string) error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.VolumeManager == nil {
+		return errors.New("volume manager not configured")
+	}
+
+	return vm.VolumeManager.DetachVolume(volumeID)
+}
+
+// SessionConfig describes the configuration for starting an interactive PTY session.
+type SessionConfig struct {
+	// Cmd is the executable to run inside the guest.
+	Cmd string
+
+	// Args are the command-line arguments passed to Cmd.
+	Args []string
+
+	// Env are the environment variables set for the command.
+	Env []string
+
+	// Dir is the working directory inside the guest.
+	Dir string
+
+	// Rows is the initial terminal row count.
+	Rows uint16
+
+	// Cols is the initial terminal column count.
+	Cols uint16
+
+	// Timeout bounds how long the session may run. Zero means no per-session timeout.
+	Timeout time.Duration
+}
+
+// Session is a host-side handle to an interactive PTY session inside the guest.
+// It is safe for concurrent use: SendInput and ReceiveOutput can be called
+// from different goroutines.
+type Session struct {
+	mu        sync.Mutex
+	conn      io.ReadWriteCloser
+	sessionID string
+	sandbox   *Sandbox
+	done      chan struct{}
+	outputCh  chan []byte
+	errCh     chan error
+}
+
+// StartSession starts an interactive PTY session inside the sandboxed guest.
+// It dials the guest vsock, sends the session_start request, and returns a
+// Session handle once the guest acknowledges session_started.
+//
+// The session remains attached to this connection. Use Detach to disconnect
+// without terminating, or Terminate to stop the session.
+func (s *Sandbox) StartSession(ctx context.Context, cfg SessionConfig) (*Session, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := s.vm
+	s.mu.Unlock()
+
+	if vm.State() != StateRunning {
+		return nil, fmt.Errorf("sandbox VM not running (state=%s)", vm.State())
+	}
+
+	sessionID := newSessionID()
+
+	conn, err := vm.Vsock().Dial(ctx, s.cfg.VsockPort)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox vsock dial: %w", err)
+	}
+
+	// Send session_start request.
+	req := map[string]any{
+		"kind":            "session_start",
+		"session_id":      sessionID,
+		"command":         cfg.Cmd,
+		"args":            cfg.Args,
+		"env":             cfg.Env,
+		"working_dir":     cfg.Dir,
+		"rows":            cfg.Rows,
+		"cols":            cfg.Cols,
+		"timeout_seconds": cfg.Timeout.Seconds(),
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("marshal session start: %w", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write session start length: %w", err)
+	}
+	if err := writeFull(conn, payload); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write session start payload: %w", err)
+	}
+
+	// Read session_started response.
+	msgCh := make(chan decodeResult, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			frameLen := binary.BigEndian.Uint32(lenBuf[:])
+			if frameLen == 0 || frameLen > 1<<20 {
+				msgCh <- decodeResult{err: fmt.Errorf("invalid frame length: %d", frameLen)}
+				return
+			}
+			payload := make([]byte, frameLen)
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			var msg map[string]any
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			msgCh <- decodeResult{msg: msg}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		conn.Close()
+		return nil, ctx.Err()
+	case res, ok := <-msgCh:
+		if !ok {
+			conn.Close()
+			return nil, errors.New("guest connection closed before session started")
+		}
+		if res.err != nil {
+			conn.Close()
+			if errors.Is(res.err, io.EOF) || errors.Is(res.err, io.ErrUnexpectedEOF) {
+				return nil, errors.New("guest connection closed before session started")
+			}
+			return nil, fmt.Errorf("read guest message: %w", res.err)
+		}
+		if kind, _ := res.msg["kind"].(string); kind == "error" {
+			conn.Close()
+			if msg, _ := res.msg["message"].(string); msg != "" {
+				return nil, errors.New("guest error: " + msg)
+			}
+			return nil, errors.New("guest error")
+		}
+		if kind, _ := res.msg["kind"].(string); kind != "session_started" {
+			conn.Close()
+			return nil, fmt.Errorf("unexpected response: %v", res.msg)
+		}
+		// Connection is now dedicated to this session. Start the output reader.
+		sess := &Session{
+			conn:      conn,
+			sessionID: sessionID,
+			sandbox:   s,
+			done:      make(chan struct{}),
+			outputCh:  make(chan []byte, 128),
+			errCh:     make(chan error, 1),
+		}
+		go sess.readLoop(msgCh)
+		return sess, nil
+	}
+}
+
+// readLoop reads messages from the connection and routes them to outputCh or errCh.
+func (sess *Session) readLoop(msgCh chan decodeResult) {
+	defer close(sess.done)
+	defer close(sess.outputCh)
+
+	for res := range msgCh {
+		if res.err != nil {
+			select {
+			case sess.errCh <- res.err:
+			default:
+			}
+			return
+		}
+		if kind, _ := res.msg["kind"].(string); kind == "session_output" {
+			if data, _ := res.msg["data"].(string); data != "" {
+				select {
+				case sess.outputCh <- []byte(data):
+				case <-sess.done:
+					return
+				}
+			}
+		} else if kind == "session_finished" {
+			return
+		} else if kind == "error" {
+			select {
+			case sess.errCh <- errors.New("guest error"):
+			default:
+			}
+			return
+		}
+	}
+}
+
+// decodeResult is a decoded vsock message.
+type decodeResult struct {
+	msg map[string]any
+	err error
+}
+
+// SendInput sends input bytes to the session's PTY master.
+func (sess *Session) SendInput(data []byte) error {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	if sess.conn == nil {
+		return errors.New("session is closed")
+	}
+
+	req := map[string]any{
+		"kind":       "session_input",
+		"session_id": sess.sessionID,
+		"data":       string(data),
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal session input: %w", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(sess.conn, lenBuf[:]); err != nil {
+		return fmt.Errorf("write session input length: %w", err)
+	}
+	if err := writeFull(sess.conn, payload); err != nil {
+		return fmt.Errorf("write session input payload: %w", err)
+	}
+	return nil
+}
+
+// ReceiveOutput returns the next chunk of PTY output. It blocks until output
+// is available, the session finishes, or ctx is cancelled. The returned bytes
+// are valid until the next call to ReceiveOutput.
+func (sess *Session) ReceiveOutput(ctx context.Context) ([]byte, error) {
+	select {
+	case data, ok := <-sess.outputCh:
+		if !ok {
+			return nil, errors.New("session finished")
+		}
+		return data, nil
+	case err := <-sess.errCh:
+		return nil, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// Resize changes the terminal dimensions of the session.
+func (sess *Session) Resize(rows, cols uint16) error {
+	sess.mu.Lock()
+	if sess.conn == nil {
+		sess.mu.Unlock()
+		return errors.New("session is closed")
+	}
+	sess.mu.Unlock()
+
+	req := map[string]any{
+		"kind":       "session_resize",
+		"session_id": sess.sessionID,
+		"rows":       rows,
+		"cols":       cols,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal session resize: %w", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(sess.conn, lenBuf[:]); err != nil {
+		return fmt.Errorf("write session resize length: %w", err)
+	}
+	if err := writeFull(sess.conn, payload); err != nil {
+		return fmt.Errorf("write session resize payload: %w", err)
+	}
+	return nil
+}
+
+// Status returns the current status of the session.
+func (sess *Session) Status(ctx context.Context) (map[string]any, error) {
+	sess.mu.Lock()
+	if sess.conn == nil {
+		sess.mu.Unlock()
+		return nil, errors.New("session is closed")
+	}
+	sessionID := sess.sessionID
+	sess.mu.Unlock()
+
+	// Open a separate vsock connection for the status query, since the session
+	// connection's readLoop is consuming messages.
+	sess.mu.Lock()
+	if sess.sandbox.done {
+		sess.mu.Unlock()
+		return nil, errors.New("sandbox is closed")
+	}
+	vm := sess.sandbox.vm
+	vsockPort := sess.sandbox.cfg.VsockPort
+	sess.mu.Unlock()
+
+	if vm.State() != StateRunning {
+		return nil, fmt.Errorf("sandbox VM not running (state=%s)", vm.State())
+	}
+
+	conn, err := vm.Vsock().Dial(ctx, vsockPort)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox vsock dial: %w", err)
+	}
+	defer conn.Close()
+
+	req := map[string]any{
+		"kind":       "session_status",
+		"session_id": sessionID,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal session status: %w", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("write session status length: %w", err)
+	}
+	if err := writeFull(conn, payload); err != nil {
+		return nil, fmt.Errorf("write session status payload: %w", err)
+	}
+
+	// Read the status response.
+	type decodeResult struct {
+		msg map[string]any
+		err error
+	}
+	msgCh := make(chan decodeResult, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			frameLen := binary.BigEndian.Uint32(lenBuf[:])
+			if frameLen == 0 || frameLen > 1<<20 {
+				msgCh <- decodeResult{err: fmt.Errorf("invalid frame length: %d", frameLen)}
+				return
+			}
+			payload := make([]byte, frameLen)
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			var msg map[string]any
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				msgCh <- decodeResult{err: err}
+				return
+			}
+			msgCh <- decodeResult{msg: msg}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res, ok := <-msgCh:
+		if !ok {
+			return nil, errors.New("guest connection closed before status response")
+		}
+		if res.err != nil {
+			if errors.Is(res.err, io.EOF) || errors.Is(res.err, io.ErrUnexpectedEOF) {
+				return nil, errors.New("guest connection closed before status response")
+			}
+			return nil, fmt.Errorf("read guest message: %w", res.err)
+		}
+		if kind, _ := res.msg["kind"].(string); kind == "error" {
+			if msg, _ := res.msg["message"].(string); msg != "" {
+				return nil, errors.New("guest error: " + msg)
+			}
+			return nil, errors.New("guest error")
+		}
+		if kind, _ := res.msg["kind"].(string); kind != "session_status" {
+			return nil, fmt.Errorf("unexpected response: %v", res.msg)
+		}
+		return res.msg, nil
+	}
+}
+
+// Terminate ends the session and closes the connection.
+func (sess *Session) Terminate(ctx context.Context) error {
+	sess.mu.Lock()
+	if sess.conn == nil {
+		sess.mu.Unlock()
+		return nil
+	}
+	conn := sess.conn
+	sess.conn = nil
+	sess.mu.Unlock()
+
+	req := map[string]any{
+		"kind":       "session_terminate",
+		"session_id": sess.sessionID,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("marshal session terminate: %w", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("write session terminate length: %w", err)
+	}
+	if err := writeFull(conn, payload); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("write session terminate payload: %w", err)
+	}
+
+	// Wait for session_finished or connection close.
+	<-sess.done
+
+	_ = conn.Close()
+	return nil
+}
+
+// Detach disconnects from the session without terminating the underlying
+// process. The session continues running in the guest and can be reattached
+// with a new StartSession call using the same session ID.
+func (sess *Session) Detach(ctx context.Context) error {
+	sess.mu.Lock()
+	if sess.conn == nil {
+		sess.mu.Unlock()
+		return nil
+	}
+	conn := sess.conn
+	sess.conn = nil
+	sess.mu.Unlock()
+
+	req := map[string]any{
+		"kind":       "session_detach",
+		"session_id": sess.sessionID,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("marshal session detach: %w", err)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("write session detach length: %w", err)
+	}
+	if err := writeFull(conn, payload); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("write session detach payload: %w", err)
+	}
+
+	_ = conn.Close()
+	return nil
+}
+
+// Close closes the session connection. The underlying process continues
+// running (equivalent to Detach).
+func (sess *Session) Close() error {
+	sess.mu.Lock()
+	if sess.conn == nil {
+		sess.mu.Unlock()
+		return nil
+	}
+	conn := sess.conn
+	sess.conn = nil
+	sess.mu.Unlock()
+	return conn.Close()
+}
+
+// newSessionID generates a unique session ID.
+func newSessionID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("sess-%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("sess-%x", buf)
+}
+
+var _ = io.Reader(nil)
+
 func validateProject(p *Project) error {
 	if p == nil {
 		return errors.New("project is nil")

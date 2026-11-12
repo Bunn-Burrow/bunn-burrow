@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/omkar/sandbox/internal/network"
+	"github.com/omkar/sandbox/internal/storage"
 )
 
 // Config holds the configuration required to create and start a Firecracker
@@ -69,6 +70,14 @@ type Config struct {
 	// When nil, the VM creates its own manager if Network is set.
 	NetworkManager *network.Manager
 
+	// VolumeManager manages persistent volumes for VM attachment. Optional;
+	// when nil, volume attach/detach is unavailable.
+	VolumeManager *storage.VolumeManager
+
+	// Volumes lists volumes to attach to this VM at startup. Each volume is
+	// attached before guest execution and detached on VM stop/destroy.
+	Volumes []storage.VolumeRef
+
 	// StartTimeout bounds the wait for Firecracker to initialize its API socket.
 	StartTimeout time.Duration
 
@@ -123,13 +132,13 @@ type NetworkConfig struct {
 // toInternal converts a vmm NetworkConfig to an internal network.Config.
 func (c *NetworkConfig) toInternal() network.Config {
 	return network.Config{
-		Enabled:       c.Enabled,
-		Bridge:        c.Bridge,
-		CIDR:          c.CIDR,
-		Gateway:       c.Gateway,
-		NATInterface:  c.NATInterface,
-		Firewall:      c.Firewall,
-		MTU:           c.MTU,
+		Enabled:      c.Enabled,
+		Bridge:       c.Bridge,
+		CIDR:         c.CIDR,
+		Gateway:      c.Gateway,
+		NATInterface: c.NATInterface,
+		Firewall:     c.Firewall,
+		MTU:          c.MTU,
 	}
 }
 
