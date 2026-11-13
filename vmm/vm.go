@@ -815,7 +815,7 @@ func (vm *VM) Destroy(ctx context.Context) error {
 	// Best-effort graceful shutdown first, while the state machine still
 	// reflects a stoppable state.
 	switch state {
-	case StateRunning, StatePaused, StateStopping:
+	case StateRunning, StatePaused:
 		_ = vm.Stop(ctx)
 	case StateFailed:
 		if proc := vm.process(); proc != nil {
@@ -832,6 +832,11 @@ func (vm *VM) Destroy(ctx context.Context) error {
 		select {
 		case <-proc.Exited():
 		case <-time.After(5 * time.Second):
+			select {
+			case <-proc.Exited():
+			default:
+				return fmt.Errorf("destroy: firecracker process %d did not terminate; VM resources were retained", proc.PID())
+			}
 		}
 	}
 
@@ -1157,7 +1162,10 @@ func resolveFirecrackerBin() string {
 	if p, err := exec.LookPath("firecracker"); err == nil {
 		return p
 	}
-	return "/home/omkar/.local/bin/firecracker"
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "bin", "firecracker")
+	}
+	return "firecracker"
 }
 
 var _ = syscall.SIGTERM

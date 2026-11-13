@@ -66,8 +66,9 @@ type procSession struct {
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
 
-	// masterFd is the PTY master file descriptor.
-	masterFd int
+	master       *os.File
+	ptyMu        sync.Mutex
+	masterClosed bool
 
 	// doneCh closes when the session's process has exited.
 	doneCh chan struct{}
@@ -186,7 +187,7 @@ func (sm *SessionManager) StartSession(id, cmd string, args []string, env []stri
 		},
 		cmd:      command,
 		cancel:   cancel,
-		masterFd: masterFd,
+		master:   os.NewFile(uintptr(masterFd), "pty-master"),
 		doneCh:   make(chan struct{}),
 		outputCh: make(chan []byte, 64),
 		inputCh:  make(chan []byte, 64),
@@ -201,7 +202,8 @@ func (sm *SessionManager) StartSession(id, cmd string, args []string, env []stri
 	// Wait for process exit.
 	go sm.waitSession(id, session)
 
-	return &session.info, nil
+	info := session.info
+	return &info, nil
 }
 
 // setWinsize sets the terminal window size on a PTY slave fd.
@@ -237,7 +239,12 @@ func (sm *SessionManager) Resize(id string, rows, cols uint16) error {
 	}
 	sm.mu.Unlock()
 
-	if err := setWinsize(session.masterFd, rows, cols); err != nil {
+	session.ptyMu.Lock()
+	defer session.ptyMu.Unlock()
+	if session.masterClosed {
+		return fmt.Errorf("session %s PTY is closed", id)
+	}
+	if err := setWinsize(int(session.master.Fd()), rows, cols); err != nil {
 		return fmt.Errorf("set terminal size: %w", err)
 	}
 
@@ -318,15 +325,13 @@ func (sm *SessionManager) Terminate(id string) error {
 	}
 
 	// Close the PTY master.
-	if session.masterFd >= 0 {
-		_ = unix.Close(session.masterFd)
-	}
+	_ = session.closeMaster()
 
 	return nil
 }
 
-// Detach disconnects the caller from a session without terminating the
-// underlying process. The session remains tracked and can be reattached.
+// Detach closes the PTY connection without terminating the underlying process.
+// The session remains tracked, but the closed PTY cannot be reattached.
 func (sm *SessionManager) Detach(id string) error {
 	sm.mu.Lock()
 	session, exists := sm.sessions[id]
@@ -338,10 +343,7 @@ func (sm *SessionManager) Detach(id string) error {
 
 	// Close the master fd so the caller can no longer read/write, but keep
 	// the process running.
-	if session.masterFd >= 0 {
-		_ = unix.Close(session.masterFd)
-		session.masterFd = -1
-	}
+	_ = session.closeMaster()
 
 	return nil
 }
@@ -364,7 +366,7 @@ func (sm *SessionManager) pumpOutput(id string, session *procSession) {
 
 	buf := make([]byte, 4096)
 	for {
-		n, err := unix.Read(session.masterFd, buf)
+		n, err := session.master.Read(buf)
 		if n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
@@ -375,7 +377,7 @@ func (sm *SessionManager) pumpOutput(id string, session *procSession) {
 			}
 		}
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && !errors.Is(err, os.ErrClosed) {
 				sm.mu.Lock()
 				session.info.Err = err
 				sm.mu.Unlock()
@@ -390,7 +392,10 @@ func (sm *SessionManager) pumpInput(id string, session *procSession) {
 	for {
 		select {
 		case data := <-session.inputCh:
-			if _, err := unix.Write(session.masterFd, data); err != nil {
+			if _, err := session.master.Write(data); err != nil {
+				if errors.Is(err, os.ErrClosed) {
+					return
+				}
 				sm.mu.Lock()
 				session.info.Err = err
 				sm.mu.Unlock()
@@ -400,6 +405,16 @@ func (sm *SessionManager) pumpInput(id string, session *procSession) {
 			return
 		}
 	}
+}
+
+func (session *procSession) closeMaster() error {
+	session.ptyMu.Lock()
+	defer session.ptyMu.Unlock()
+	if session.masterClosed {
+		return nil
+	}
+	session.masterClosed = true
+	return session.master.Close()
 }
 
 // waitSession waits for the process to exit and updates session state.

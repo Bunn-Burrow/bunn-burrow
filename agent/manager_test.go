@@ -99,6 +99,27 @@ func TestAgentManagerStartSuccess(t *testing.T) {
 	require.True(t, sb.Closed, "sandbox should be closed after execution")
 }
 
+func TestAgentManagerSandboxCloseFailure(t *testing.T) {
+	provider := NewFakeVMProvider()
+	sb := NewFakeVMSandbox("close-fail-vm")
+	sb.CloseErr = errors.New("failed to remove VM resources")
+	provider.NextSandbox = sb
+
+	mgr := NewManager(provider)
+	_, err := mgr.Create(context.Background(), AgentConfig{
+		ID:      "close-fail-1",
+		Command: "python3",
+	})
+	require.NoError(t, err)
+	require.NoError(t, mgr.Start(context.Background(), "close-fail-1"))
+
+	res, err := mgr.Wait(context.Background(), "close-fail-1")
+	require.NoError(t, err)
+	require.Equal(t, StateFailed, res.State)
+	require.Contains(t, res.Error, "failed to remove VM resources")
+	require.True(t, sb.Closed)
+}
+
 func TestAgentManagerProcessFailedExitCode(t *testing.T) {
 	provider := NewFakeVMProvider()
 	sb := NewFakeVMSandbox("test-vm-fail")

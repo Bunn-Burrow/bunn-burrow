@@ -158,6 +158,7 @@ func TestStateMachineTerminal(t *testing.T) {
 
 func TestConfigValidate(t *testing.T) {
 	c := DefaultConfig()
+	require.Equal(t, GuestAgentVsockPort, c.VsockPort)
 	c.KernelImage = "/nonexistent/kernel"
 	c.RootFS = "/nonexistent/rootfs"
 	require.Error(t, c.Validate())

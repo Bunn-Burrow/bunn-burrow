@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -23,19 +25,20 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	cacheDir := "/tmp/bunn-burrow-cache"
-	guestAgent := "/home/omkar/sandbox/guest-agent/bin/guest-agent-static"
-	kernel := "/home/omkar/.local/firecracker/vmlinux"
-	firecrackerBin := "/home/omkar/.local/bin/firecracker"
-	workdir := "/tmp/bunn-burrow-work"
+	cacheDir := flag.String("cache-dir", envOr("BUNN_CACHE_DIR", "cache"), "environment cache directory")
+	guestAgent := flag.String("guest-agent", envOr("BUNN_GUEST_AGENT", filepath.Join("bin", "guest-agent-static")), "Guest Agent binary to inject")
+	kernel := flag.String("kernel", envOr("FIRECRACKER_KERNEL", defaultKernelPath()), "kernel image path")
+	firecrackerBin := flag.String("bin", envOr("FIRECRACKER_BIN", defaultFirecrackerPath()), "Firecracker binary path")
+	workdir := flag.String("workdir", envOr("FIRECRACKER_WORKDIR", filepath.Join("cache", "work")), "VM working directory")
+	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	cfg := prepare.Config{
-		CacheDir:    cacheDir,
-		RootfsDir:   filepathJoin(cacheDir, "rootfs"),
-		GuestAgent:  guestAgent,
+		CacheDir:    *cacheDir,
+		RootfsDir:   filepath.Join(*cacheDir, "rootfs"),
+		GuestAgent:  *guestAgent,
 		OverlaySize: 1024 * 1024 * 1024, // 1 GiB
 	}
 
@@ -88,21 +91,40 @@ func main() {
 
 	// Boot sandbox 1 using the prepared environment
 	log.Println("Booting sandbox 1...")
-	if err := bootAndTestVM(ctx, kernel, env.RootfsPath, overlay1, firecrackerBin, workdir, "vm-1"); err != nil {
+	if err := bootAndTestVM(ctx, *kernel, env.RootfsPath, overlay1, *firecrackerBin, *workdir, "vm-1"); err != nil {
 		log.Fatalf("sandbox 1 boot/test: %v", err)
 	}
 
 	// Boot sandbox 2 using the same prepared environment (cache hit)
 	log.Println("Booting sandbox 2 (cache hit)...")
-	if err := bootAndTestVM(ctx, kernel, env.RootfsPath, overlay2, firecrackerBin, workdir, "vm-2"); err != nil {
+	if err := bootAndTestVM(ctx, *kernel, env.RootfsPath, overlay2, *firecrackerBin, *workdir, "vm-2"); err != nil {
 		log.Fatalf("sandbox 2 boot/test: %v", err)
 	}
 
 	log.Println("M2 infrastructure verification complete.")
 }
 
-func filepathJoin(a, b string) string {
-	return a + "/" + b
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func defaultKernelPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "firecracker", "vmlinux")
+}
+
+func defaultFirecrackerPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "firecracker"
+	}
+	return filepath.Join(home, ".local", "bin", "firecracker")
 }
 
 func vsockCID(vmID string) uint32 {
@@ -116,10 +138,10 @@ func bootAndTestVM(ctx context.Context, kernel, rootfs, overlay, bin, workdir, v
 	vmCfg := vmm.Config{
 		KernelImage:  kernel,
 		RootFS:       rootfs,
-		WorkDir:      filepathJoin(workdir, vmID),
+		WorkDir:      filepath.Join(workdir, vmID),
 		BinPath:      bin,
 		VsockCID:     vsockCID(vmID),
-		VsockPort:    8080,
+		VsockPort:    vmm.GuestAgentVsockPort,
 		VCPU:         2,
 		MemSizeMiB:   1024,
 		StartTimeout: 30 * time.Second,
@@ -159,7 +181,7 @@ func bootAndTestVM(ctx context.Context, kernel, rootfs, overlay, bin, workdir, v
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer stopCancel()
 	if err := vm.Stop(stopCtx); err != nil {
-		logger.Printf("VM stop warning: %v", err)
+		return fmt.Errorf("stop VM: %w", err)
 	}
 	logger.Println("VM stopped")
 	return nil
@@ -243,7 +265,7 @@ func waitForReady(ctx context.Context, vm *vmm.VM) error {
 			}
 			return readyCtx.Err()
 		case <-ticker.C:
-			c, err := dialVSock(readyCtx, vm, 8080)
+			c, err := dialVSock(readyCtx, vm, vmm.GuestAgentVsockPort)
 			if err == nil {
 				conn = c
 				goto connected
@@ -288,7 +310,7 @@ connected:
 }
 
 func sendShutdown(ctx context.Context, vm *vmm.VM) error {
-	conn, err := dialVSock(ctx, vm, 8080)
+	conn, err := dialVSock(ctx, vm, vmm.GuestAgentVsockPort)
 	if err != nil {
 		return fmt.Errorf("vsock dial: %w", err)
 	}

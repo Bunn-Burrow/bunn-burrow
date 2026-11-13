@@ -14,6 +14,9 @@ import (
 	vmimage "github.com/omkar/sandbox/internal/vmimage"
 )
 
+// GuestAgentVsockPort is the port the bundled Guest Agent listens on.
+const GuestAgentVsockPort uint32 = 8080
+
 // Config holds the configuration required to create and start a Firecracker
 // microVM. All paths must be absolute and point at existing artifacts unless
 // otherwise noted.
@@ -112,7 +115,7 @@ func DefaultConfig() Config {
 		VCPU:             2,
 		MemSizeMiB:       1024,
 		VsockCID:         3,
-		VsockPort:        1024,
+		VsockPort:        GuestAgentVsockPort,
 		StartTimeout:     10 * time.Second,
 		StopTimeout:      15 * time.Second,
 		StopGraceTimeout: 5 * time.Second,

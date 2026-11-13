@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
@@ -98,6 +99,7 @@ func TestCLIAgentStartAndCancel(t *testing.T) {
 	rootCmd, mgr, provider := setupTestCLI()
 
 	sb := agent.NewFakeVMSandbox("vm-test")
+	sb.ExecuteDelay = time.Second
 	provider.NextSandbox = sb
 
 	_, err := mgr.Create(context.Background(), agent.AgentConfig{

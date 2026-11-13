@@ -150,7 +150,31 @@ func (s *Sandbox) Start(ctx context.Context) error {
 	if err := vm.Start(ctx); err != nil {
 		return fmt.Errorf("sandbox start: %w", err)
 	}
-	return nil
+
+	startupTimeout := s.cfg.StartTimeout
+	if startupTimeout <= 0 {
+		startupTimeout = 30 * time.Second
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		conn, err := vm.Vsock().Dial(readyCtx, s.cfg.VsockPort)
+		if err == nil {
+			return conn.Close()
+		}
+		lastErr = err
+
+		select {
+		case <-readyCtx.Done():
+			return fmt.Errorf("sandbox guest agent not ready on vsock port %d: %w (last dial: %v)",
+				s.cfg.VsockPort, readyCtx.Err(), lastErr)
+		case <-ticker.C:
+		}
+	}
 }
 
 // Execute runs workload inside the sandboxed guest over vsock. Stdout and
@@ -268,12 +292,16 @@ func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, s
 	if execID == "" {
 		execID = "exec"
 	}
+	env, err := envSliceToMap(w.Env)
+	if err != nil {
+		return -1, err
+	}
 	req := map[string]any{
 		"kind":            "execute",
 		"execution_id":    execID,
 		"command":         w.Cmd,
 		"args":            w.Args,
-		"env":             w.Env,
+		"env":             env,
 		"working_dir":     w.Dir,
 		"timeout_seconds": w.Timeout.Seconds(),
 	}
@@ -391,6 +419,18 @@ func runExec(ctx context.Context, conn io.ReadWriteCloser, w Workload, stdout, s
 			}
 		}
 	}
+}
+
+func envSliceToMap(env []string) (map[string]string, error) {
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("invalid environment entry %q: expected KEY=VALUE", entry)
+		}
+		values[key] = value
+	}
+	return values, nil
 }
 
 // writeFull writes all of buf to w, returning an error if the write is
@@ -1076,6 +1116,10 @@ func (s *Sandbox) StartSession(ctx context.Context, cfg SessionConfig) (*Session
 	}
 
 	sessionID := newSessionID()
+	env, err := envSliceToMap(cfg.Env)
+	if err != nil {
+		return nil, err
+	}
 
 	conn, err := vm.Vsock().Dial(ctx, s.cfg.VsockPort)
 	if err != nil {
@@ -1088,7 +1132,7 @@ func (s *Sandbox) StartSession(ctx context.Context, cfg SessionConfig) (*Session
 		"session_id":      sessionID,
 		"command":         cfg.Cmd,
 		"args":            cfg.Args,
-		"env":             cfg.Env,
+		"env":             env,
 		"working_dir":     cfg.Dir,
 		"rows":            cfg.Rows,
 		"cols":            cfg.Cols,
@@ -1664,7 +1708,12 @@ func (s *Sandbox) Close(ctx context.Context) error {
 	// Only attempt a graceful stop if the VM is actually running or paused.
 	if st := vm.State(); st == StateRunning || st == StatePaused {
 		if err := vm.Stop(ctx); err != nil {
-			_ = vm.Destroy(ctx)
+			if destroyErr := vm.Destroy(ctx); destroyErr != nil {
+				return errors.Join(
+					fmt.Errorf("sandbox stop: %w", err),
+					fmt.Errorf("sandbox destroy: %w", destroyErr),
+				)
+			}
 			return fmt.Errorf("sandbox stop: %w", err)
 		}
 	}

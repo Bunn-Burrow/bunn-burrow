@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -14,16 +16,17 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	cacheDir := "/home/omkar/bunn-burrow/cache"
-	guestAgent := "/home/omkar/bunn-burrow/guest-agent/bin/guest-agent-static"
+	cacheDir := flag.String("cache-dir", envOr("BUNN_CACHE_DIR", "cache"), "environment cache directory")
+	guestAgent := flag.String("guest-agent", envOr("BUNN_GUEST_AGENT", filepath.Join("bin", "guest-agent-static")), "Guest Agent binary to inject")
+	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	cfg := prepare.Config{
-		CacheDir:    cacheDir,
-		RootfsDir:   cacheDir + "/rootfs",
-		GuestAgent:  guestAgent,
+		CacheDir:    *cacheDir,
+		RootfsDir:   filepath.Join(*cacheDir, "rootfs"),
+		GuestAgent:  *guestAgent,
 		OverlaySize: 1024 * 1024 * 1024,
 	}
 
@@ -48,4 +51,11 @@ func main() {
 	}
 	log.Printf("Environment prepared in %v: %s (size=%d bytes)", time.Since(start), env.CacheKey, env.SizeBytes)
 	log.Printf("Rootfs path: %s", env.RootfsPath)
+}
+
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }

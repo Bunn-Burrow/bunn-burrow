@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -95,12 +94,12 @@ func (f *fakeConn) ServeFrame(payload string) {
 
 func DefaultConfigWithArtifacts() Config {
 	c := DefaultConfig()
-	c.KernelImage = "/home/omkar/.local/firecracker/vmlinux"
-	c.RootFS = "/home/omkar/.local/firecracker/alpine/alpine-rootfs.ext4"
-	if _, err := os.Stat(c.KernelImage); err != nil {
+	if bin, kernel, rootfs, ok := integrationAssets(); ok {
+		c.BinPath = bin
+		c.KernelImage = kernel
+		c.RootFS = rootfs
+	} else {
 		c.KernelImage = "/dev/null"
-	}
-	if _, err := os.Stat(c.RootFS); err != nil {
 		c.RootFS = "/dev/null"
 	}
 	return c
@@ -270,7 +269,7 @@ func TestSandboxExecuteSendsCorrectRequest(t *testing.T) {
 	_, err := runExec(context.Background(), conn, Workload{
 		Cmd:     "/bin/echo",
 		Args:    []string{"hello"},
-		Env:     []string{"FOO=bar"},
+		Env:     []string{"FOO=bar=baz"},
 		Dir:     "/tmp",
 		Timeout: 5 * time.Second,
 	}, nil, nil, nil)
@@ -283,7 +282,7 @@ func TestSandboxExecuteSendsCorrectRequest(t *testing.T) {
 	require.Equal(t, "exec", parsed["execution_id"])
 	require.Equal(t, "/bin/echo", parsed["command"])
 	require.Equal(t, []any{"hello"}, parsed["args"])
-	require.Equal(t, []any{"FOO=bar"}, parsed["env"])
+	require.Equal(t, map[string]any{"FOO": "bar=baz"}, parsed["env"])
 	require.Equal(t, "/tmp", parsed["working_dir"])
 	require.Equal(t, float64(5), parsed["timeout_seconds"])
 }
@@ -484,7 +483,7 @@ func TestSessionStartRequest(t *testing.T) {
 	require.Equal(t, "session_start", parsed["kind"])
 	require.Equal(t, "/bin/sh", parsed["command"])
 	require.Equal(t, []any{"-c", "echo hi"}, parsed["args"])
-	require.Equal(t, []any{"FOO=bar"}, parsed["env"])
+	require.Equal(t, map[string]any{"FOO": "bar"}, parsed["env"])
 	require.Equal(t, "/tmp", parsed["working_dir"])
 	require.Equal(t, float64(24), parsed["rows"])
 	require.Equal(t, float64(80), parsed["cols"])
@@ -551,13 +550,17 @@ func TestNewSessionIDUnique(t *testing.T) {
 // a Session for testing the session API without a real VM.
 func StartSessionTest(ctx context.Context, conn *fakeConn, cfg SessionConfig) (*Session, error) {
 	sessionID := newSessionID()
+	env, err := envSliceToMap(cfg.Env)
+	if err != nil {
+		return nil, err
+	}
 
 	req := map[string]any{
 		"kind":            "session_start",
 		"session_id":      sessionID,
 		"command":         cfg.Cmd,
 		"args":            cfg.Args,
-		"env":             cfg.Env,
+		"env":             env,
 		"working_dir":     cfg.Dir,
 		"rows":            cfg.Rows,
 		"cols":            cfg.Cols,

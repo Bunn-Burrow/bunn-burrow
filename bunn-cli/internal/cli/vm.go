@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -136,6 +137,16 @@ func stopVM(vm *vmm.VM, timeout time.Duration) error {
 	return nil
 }
 
+func stopAndDestroyVM(vm *vmm.VM, timeout time.Duration) error {
+	stopErr := stopVM(vm, timeout)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	destroyErr := vm.Destroy(ctx)
+
+	return errors.Join(stopErr, destroyErr)
+}
+
 // newVMRunCommand creates the `vm run` subcommand.
 // `bunn vm run` is a foreground session: it starts a VM, runs until interrupted,
 // and reliably cleans up the Firecracker process on exit.
@@ -160,6 +171,7 @@ func newVMRunCommand(loader *config.Loader) *cobra.Command {
 		networkNATIface string
 		networkFirewall bool
 		networkMTU      int
+		trackedVMID     string
 	)
 
 	cmd := &cobra.Command{
@@ -235,7 +247,7 @@ is lost. It cannot be managed by a later ` + "`bunn`" + ` invocation.`,
 
 			// Track the VM so it can be cleaned up on any exit path.
 			globalTracker.add(vm)
-			defer globalTracker.remove(vm.ID())
+			trackedVMID = vm.ID()
 
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
@@ -272,11 +284,11 @@ is lost. It cannot be managed by a later ` + "`bunn`" + ` invocation.`,
 	}
 
 	// PersistentPostRunE guarantees cleanup runs even if RunE returns an error
-	// (e.g., startup failure). It stops the VM if it was successfully started,
-	// and surfaces cleanup errors instead of swallowing them.
+	// (e.g., startup failure). It stops and destroys the VM, then removes it
+	// from the in-process tracker.
 	cmd.PersistentPostRunE = func(cmd *cobra.Command, args []string) error {
-		id := vmID
-		if len(args) > 0 {
+		id := trackedVMID
+		if id == "" && len(args) > 0 {
 			id = args[0]
 		}
 		if id == "" {
@@ -286,8 +298,9 @@ is lost. It cannot be managed by a later ` + "`bunn`" + ` invocation.`,
 		if !ok {
 			return nil
 		}
-		if err := stopVM(vm, 30*time.Second); err != nil {
-			return err
+		defer globalTracker.remove(id)
+		if err := stopAndDestroyVM(vm, 30*time.Second); err != nil {
+			return fmt.Errorf("cleanup VM %q: %w", id, err)
 		}
 		return nil
 	}

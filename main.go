@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,7 +34,7 @@ func run(args []string) error {
 	vcpu := fs.Int64("vcpu", 2, "vCPU count")
 	mem := fs.Int64("mem", 1024, "memory MiB")
 	cid := fs.Uint("cid", 3, "vsock guest CID")
-	port := fs.Uint("port", 1024, "guest vsock port")
+	port := fs.Uint("port", uint(vmm.GuestAgentVsockPort), "guest vsock port")
 	bin := fs.String("bin", os.Getenv("FIRECRACKER_BIN"), "firecracker binary path")
 
 	if len(args) == 0 {
@@ -74,14 +75,14 @@ func run(args []string) error {
 	}
 }
 
-func start(ctx context.Context, cfg vmm.Config, logger *logrus.Logger) error {
+func start(ctx context.Context, cfg vmm.Config, logger *logrus.Logger) (runErr error) {
 	vm, err := vmm.New(cfg, logger.WithField("component", "vmm"))
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if err := vm.Destroy(context.Background()); err != nil {
-			logger.WithError(err).Error("destroy")
+			runErr = errors.Join(runErr, fmt.Errorf("destroy VM: %w", err))
 		}
 	}()
 
@@ -91,13 +92,13 @@ func start(ctx context.Context, cfg vmm.Config, logger *logrus.Logger) error {
 	logger.Infof("VM %s running (pid=%d, state=%s)", vm.ID(), vm.PID(), vm.State())
 
 	// Wait for guest agent readiness over vsock.
-	if err := waitForReady(ctx, vm, logger); err != nil {
+	if err := waitForReady(ctx, vm, logger, cfg.VsockPort); err != nil {
 		return fmt.Errorf("guest not ready: %w", err)
 	}
 	logger.Info("guest agent ready")
 
 	// Send shutdown request over vsock.
-	if err := sendShutdown(ctx, vm, logger); err != nil {
+	if err := sendShutdown(ctx, vm, logger, cfg.VsockPort); err != nil {
 		return fmt.Errorf("shutdown request failed: %w", err)
 	}
 	logger.Info("shutdown requested")
@@ -177,7 +178,7 @@ func dialVSock(ctx context.Context, vm *vmm.VM, port uint32) (*vsockConn, error)
 
 // waitForReady dials the guest vsock, performs the protocol handshake,
 // and polls the health endpoint until the guest agent responds.
-func waitForReady(ctx context.Context, vm *vmm.VM, logger *logrus.Logger) error {
+func waitForReady(ctx context.Context, vm *vmm.VM, logger *logrus.Logger, port uint32) error {
 	deadline, _ := ctx.Deadline()
 	if deadline.IsZero() {
 		deadline = time.Now().Add(30 * time.Second)
@@ -197,7 +198,7 @@ func waitForReady(ctx context.Context, vm *vmm.VM, logger *logrus.Logger) error 
 			}
 			return readyCtx.Err()
 		case <-ticker.C:
-			c, err := dialVSock(readyCtx, vm, 8080)
+			c, err := dialVSock(readyCtx, vm, port)
 			if err == nil {
 				conn = c
 				goto connected
@@ -244,8 +245,8 @@ connected:
 }
 
 // sendShutdown dials the guest vsock and sends a shutdown request.
-func sendShutdown(ctx context.Context, vm *vmm.VM, logger *logrus.Logger) error {
-	conn, err := dialVSock(ctx, vm, 8080)
+func sendShutdown(ctx context.Context, vm *vmm.VM, logger *logrus.Logger, port uint32) error {
+	conn, err := dialVSock(ctx, vm, port)
 	if err != nil {
 		return fmt.Errorf("vsock dial: %w", err)
 	}
@@ -278,7 +279,7 @@ func sendShutdown(ctx context.Context, vm *vmm.VM, logger *logrus.Logger) error 
 
 // execCmd executes a command inside a running VM.
 // Usage: vmm exec <vm-id> <command> [args...]
-func execCmd(ctx context.Context, cfg vmm.Config, args []string) error {
+func execCmd(ctx context.Context, cfg vmm.Config, args []string) (runErr error) {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: vmm exec <vm-id> <command> [args...]")
 	}
@@ -291,7 +292,9 @@ func execCmd(ctx context.Context, cfg vmm.Config, args []string) error {
 		return fmt.Errorf("create VM: %w", err)
 	}
 	defer func() {
-		_ = vm.Destroy(context.Background())
+		if err := vm.Destroy(context.Background()); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("destroy VM: %w", err))
+		}
 	}()
 
 	if err := vm.Start(ctx); err != nil {
@@ -299,7 +302,7 @@ func execCmd(ctx context.Context, cfg vmm.Config, args []string) error {
 	}
 
 	// Wait for guest agent readiness.
-	if err := waitForReadyExec(ctx, vm); err != nil {
+	if err := waitForReadyExec(ctx, vm, cfg.VsockPort); err != nil {
 		return fmt.Errorf("guest not ready: %w", err)
 	}
 
@@ -307,7 +310,7 @@ func execCmd(ctx context.Context, cfg vmm.Config, args []string) error {
 	execID := "exec-" + vmID
 	timeout := 30 * time.Second
 
-	if err := sendExecute(ctx, vm, execID, command, cmdArgs, nil, "", "", timeout); err != nil {
+	if err := sendExecute(ctx, vm, cfg.VsockPort, execID, command, cmdArgs, nil, "", "", timeout); err != nil {
 		return fmt.Errorf("execute: %w", err)
 	}
 
@@ -322,7 +325,7 @@ func execCmd(ctx context.Context, cfg vmm.Config, args []string) error {
 }
 
 // waitForReadyExec waits for guest agent readiness (no logging).
-func waitForReadyExec(ctx context.Context, vm *vmm.VM) error {
+func waitForReadyExec(ctx context.Context, vm *vmm.VM, port uint32) error {
 	deadline, _ := ctx.Deadline()
 	if deadline.IsZero() {
 		deadline = time.Now().Add(30 * time.Second)
@@ -342,7 +345,7 @@ func waitForReadyExec(ctx context.Context, vm *vmm.VM) error {
 			}
 			return readyCtx.Err()
 		case <-ticker.C:
-			c, err := dialVSock(readyCtx, vm, 8080)
+			c, err := dialVSock(readyCtx, vm, port)
 			if err == nil {
 				conn = c
 				goto connected
@@ -387,8 +390,8 @@ connected:
 }
 
 // sendExecute sends an execute request and streams output to stdout/stderr.
-func sendExecute(ctx context.Context, vm *vmm.VM, execID, command string, args []string, env map[string]string, workdir, user string, timeout time.Duration) error {
-	conn, err := dialVSock(ctx, vm, 8080)
+func sendExecute(ctx context.Context, vm *vmm.VM, port uint32, execID, command string, args []string, env map[string]string, workdir, user string, timeout time.Duration) error {
+	conn, err := dialVSock(ctx, vm, port)
 	if err != nil {
 		return fmt.Errorf("vsock dial: %w", err)
 	}

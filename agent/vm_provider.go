@@ -140,6 +140,7 @@ type FakeVMSandbox struct {
 	ExecuteStdout    string
 	ExecuteStderr    string
 	ExecuteDelay     time.Duration
+	CloseErr         error
 	CancelErr        error
 	UploadErr        error
 	DownloadErr      error
@@ -240,7 +241,7 @@ func (f *FakeVMSandbox) Close(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Closed = true
-	return nil
+	return f.CloseErr
 }
 
 // FakeVMProvider creates FakeVMSandbox instances for testing.

@@ -196,13 +196,23 @@ func (m *Manager) runExecution(ctx context.Context, cfg *AgentConfig, rawSecrets
 	}
 	m.mu.Unlock()
 
+	closeAttempted := false
+	closeSandbox := func() error {
+		if closeAttempted {
+			return nil
+		}
+		closeAttempted = true
+		return sb.Close(context.Background())
+	}
 	defer func() {
-		_ = sb.Close(context.Background())
+		if !closeAttempted {
+			_ = closeSandbox()
+		}
 	}()
 
 	// 3. Boot sandbox VM
 	if err := sb.Start(ctx); err != nil {
-		m.failExecution(id, fmt.Errorf("boot VM sandbox: %w", err), startTime)
+		m.failExecution(id, withSandboxCloseError(fmt.Errorf("boot VM sandbox: %w", err), closeSandbox()), startTime)
 		return
 	}
 
@@ -210,11 +220,11 @@ func (m *Manager) runExecution(ctx context.Context, cfg *AgentConfig, rawSecrets
 	if cfg.Workspace != nil && len(cfg.Workspace.Files) > 0 {
 		proj, err := BuildProject(cfg.Workspace, id)
 		if err != nil {
-			m.failExecution(id, fmt.Errorf("build project files: %w", err), startTime)
+			m.failExecution(id, withSandboxCloseError(fmt.Errorf("build project files: %w", err), closeSandbox()), startTime)
 			return
 		}
 		if err := sb.UploadProject(ctx, proj); err != nil {
-			m.failExecution(id, fmt.Errorf("upload project files to guest: %w", err), startTime)
+			m.failExecution(id, withSandboxCloseError(fmt.Errorf("upload project files to guest: %w", err), closeSandbox()), startTime)
 			return
 		}
 	}
@@ -222,7 +232,7 @@ func (m *Manager) runExecution(ctx context.Context, cfg *AgentConfig, rawSecrets
 	// 5. Prepare execution environment (merging env + secrets)
 	execEnv, err := PrepareExecutionEnv(cfg.Env, rawSecrets)
 	if err != nil {
-		m.failExecution(id, fmt.Errorf("prepare environment: %w", err), startTime)
+		m.failExecution(id, withSandboxCloseError(fmt.Errorf("prepare environment: %w", err), closeSandbox()), startTime)
 		return
 	}
 
@@ -313,6 +323,7 @@ func (m *Manager) runExecution(ctx context.Context, cfg *AgentConfig, rawSecrets
 	_ = stdoutPipeWriter.Close()
 	_ = stderrPipeWriter.Close()
 	streamWg.Wait()
+	closeErr := closeSandbox()
 
 	// Clean up secrets from memory
 	m.mu.Lock()
@@ -355,6 +366,15 @@ func (m *Manager) runExecution(ctx context.Context, cfg *AgentConfig, rawSecrets
 	} else {
 		finalState = StateSucceeded
 	}
+	if closeErr != nil {
+		if finalErr != "" {
+			finalErr += "; "
+		}
+		finalErr += fmt.Sprintf("close VM sandbox: %v", closeErr)
+		if finalState == StateSucceeded {
+			finalState = StateFailed
+		}
+	}
 
 	exec.State = finalState
 	exec.Error = finalErr
@@ -378,6 +398,13 @@ func (m *Manager) runExecution(ctx context.Context, cfg *AgentConfig, rawSecrets
 		Data:        finalErr,
 		Timestamp:   completedAt,
 	})
+}
+
+func withSandboxCloseError(err, closeErr error) error {
+	if closeErr == nil {
+		return err
+	}
+	return errors.Join(err, fmt.Errorf("close VM sandbox: %w", closeErr))
 }
 
 // failExecution marks an execution as failed and records the error.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,7 +31,7 @@ func main() {
 		workdir    = flag.String("workdir", os.Getenv("FIRECRACKER_WORKDIR"), "base working directory")
 		bin        = flag.String("bin", os.Getenv("FIRECRACKER_BIN"), "firecracker binary path")
 		cid        = flag.Uint("cid", 3, "vsock guest CID")
-		cacheDir   = flag.String("cache-dir", "/tmp/bunn-burrow-cache", "cache directory")
+		cacheDir   = flag.String("cache-dir", "cache", "cache directory")
 		guestAgent = flag.String("guest-agent", "", "path to guest agent binary")
 	)
 	flag.Parse()
@@ -98,14 +99,14 @@ func main() {
 	}
 }
 
-func testExec(ctx context.Context, kernel, rootfs, workdir, bin string, cid uint32, vmID, command string, args []string, env map[string]string, wd, user string, timeout time.Duration, logger *log.Logger) error {
+func testExec(ctx context.Context, kernel, rootfs, workdir, bin string, cid uint32, vmID, command string, args []string, env map[string]string, wd, user string, timeout time.Duration, logger *log.Logger) (runErr error) {
 	vmCfg := vmm.Config{
 		KernelImage:  kernel,
 		RootFS:       rootfs,
 		WorkDir:      workdir + "/" + vmID,
 		BinPath:      bin,
 		VsockCID:     cid,
-		VsockPort:    8080,
+		VsockPort:    vmm.GuestAgentVsockPort,
 		VCPU:         2,
 		MemSizeMiB:   1024,
 		StartTimeout: 30 * time.Second,
@@ -117,7 +118,9 @@ func testExec(ctx context.Context, kernel, rootfs, workdir, bin string, cid uint
 		return fmt.Errorf("create VM: %w", err)
 	}
 	defer func() {
-		_ = vm.Destroy(context.Background())
+		if err := vm.Destroy(context.Background()); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("destroy VM %s: %w", vmID, err))
+		}
 	}()
 
 	if err := vm.Start(ctx); err != nil {
@@ -138,7 +141,7 @@ func testExec(ctx context.Context, kernel, rootfs, workdir, bin string, cid uint
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer stopCancel()
 	if err := vm.Stop(stopCtx); err != nil {
-		logger.Printf("VM %s: stop warning: %v", vmID, err)
+		return fmt.Errorf("stop VM %s: %w", vmID, err)
 	}
 	logger.Printf("VM %s: stopped", vmID)
 	return nil
@@ -166,7 +169,7 @@ func waitForReady(ctx context.Context, vm *vmm.VM) error {
 			}
 			return readyCtx.Err()
 		case <-ticker.C:
-			c, err := dialVSock(readyCtx, vm, 8080)
+			c, err := dialVSock(readyCtx, vm, vmm.GuestAgentVsockPort)
 			if err == nil {
 				conn = c
 				goto connected
@@ -268,7 +271,7 @@ func dialVSock(ctx context.Context, vm *vmm.VM, port uint32) (*vsockConn, error)
 }
 
 func sendExecute(ctx context.Context, vm *vmm.VM, execID, command string, args []string, env map[string]string, workdir, user string, timeout time.Duration) error {
-	conn, err := dialVSock(ctx, vm, 8080)
+	conn, err := dialVSock(ctx, vm, vmm.GuestAgentVsockPort)
 	if err != nil {
 		return fmt.Errorf("vsock dial: %w", err)
 	}

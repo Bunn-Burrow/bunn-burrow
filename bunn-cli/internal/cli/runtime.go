@@ -42,12 +42,13 @@ qemu-nbd) rather than VM state, since there is no persistent daemon.`,
   bunn runtime list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			w := output.NewWriter(output.FormatTable, "never")
+			w.SetOutput(cmd.OutOrStdout(), cmd.ErrOrStderr())
 
 			rows := [][]string{
-				{"firecracker", checkBinary("firecracker")},
-				{"kvm", checkKVM()},
-				{"qemu-img", checkBinary("qemu-img")},
-				{"qemu-nbd", checkBinary("qemu-nbd")},
+				{"firecracker", checkBinary("firecracker"), binaryPath("firecracker")},
+				{"kvm", checkKVM(), "/dev/kvm"},
+				{"qemu-img", checkBinary("qemu-img"), binaryPath("qemu-img")},
+				{"qemu-nbd", checkBinary("qemu-nbd"), binaryPath("qemu-nbd")},
 			}
 
 			if jsonOut {
@@ -118,6 +119,14 @@ func checkBinary(name string) string {
 		return "not found"
 	}
 	return "available"
+}
+
+func binaryPath(name string) string {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "not found in PATH"
+	}
+	return path
 }
 
 func checkKVM() string {

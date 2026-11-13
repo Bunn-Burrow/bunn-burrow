@@ -3,6 +3,8 @@ package vmm
 import (
 	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,12 +13,28 @@ import (
 )
 
 // integrationAssets reports whether the real firecracker binary, kernel and
-// rootfs needed for an end-to-end test are present. Paths match the task
-// specification (~/.local/firecracker/...).
+// explicitly selected rootfs needed for an end-to-end test are present. The
+// rootfs must be explicit because Firecracker can write to it during boot.
 func integrationAssets() (bin, kernel, rootfs string, ok bool) {
-	bin = "/home/omkar/.local/bin/firecracker"
-	kernel = "/home/omkar/.local/firecracker/vmlinux"
-	rootfs = "/home/omkar/.local/firecracker/alpine/alpine-rootfs.ext4"
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", "", false
+	}
+	bin = os.Getenv("FIRECRACKER_BIN")
+	if bin == "" {
+		bin, _ = exec.LookPath("firecracker")
+	}
+	if bin == "" {
+		bin = filepath.Join(home, ".local", "bin", "firecracker")
+	}
+	kernel = os.Getenv("FIRECRACKER_KERNEL")
+	if kernel == "" {
+		kernel = filepath.Join(home, ".local", "firecracker", "vmlinux")
+	}
+	rootfs = os.Getenv("FIRECRACKER_ROOTFS")
+	if rootfs == "" {
+		return "", "", "", false
+	}
 	if _, err := os.Stat(bin); err != nil {
 		return "", "", "", false
 	}
