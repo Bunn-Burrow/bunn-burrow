@@ -46,7 +46,7 @@ type Config struct {
 	VsockPort uint32
 
 	// WorkDir is the base directory under which per-VM working directories are
-	// created. If empty, os.MkdirTemp is used.
+	// created. If empty, it defaults to ~/.local/share/bunn-burrow/vms.
 	WorkDir string
 
 	// BinPath is the path to the Firecracker binary. If empty, "firecracker" is
@@ -109,7 +109,7 @@ type Config struct {
 }
 
 // DefaultConfig returns a Config with sane defaults. Callers must still set
-// KernelImage, RootFS and WorkDir before use.
+// KernelImage and RootFS before use.
 func DefaultConfig() Config {
 	return Config{
 		VCPU:             2,
@@ -138,10 +138,13 @@ type NetworkConfig struct {
 	// Gateway is the bridge/gateway IP for the VM subnet.
 	Gateway net.IP
 
+	// DNS contains IPv4 nameservers configured inside the guest.
+	DNS []net.IP
+
 	// NATInterface is the host interface used for outbound masquerade.
 	NATInterface string
 
-	// Firewall enables nftables filtering (Layer-2 VM isolation + NAT).
+	// Firewall enables scoped IPv4 NAT and forwarding rules.
 	Firewall bool
 
 	// MTU for TAP devices.
@@ -155,6 +158,7 @@ func (c *NetworkConfig) toInternal() network.Config {
 		Bridge:       c.Bridge,
 		CIDR:         c.CIDR,
 		Gateway:      c.Gateway,
+		DNS:          c.DNS,
 		NATInterface: c.NATInterface,
 		Firewall:     c.Firewall,
 		MTU:          c.MTU,
@@ -215,12 +219,21 @@ func (c Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// vmDir returns the per-VM working directory.
-func (c Config) vmDir(id string) string {
-	if c.WorkDir != "" {
-		return filepath.Join(c.WorkDir, id)
+func defaultVMWorkDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user home directory for VM storage: %w", err)
 	}
-	return filepath.Join(os.TempDir(), "vmm", id)
+	if home == "" {
+		return "", errors.New("resolve user home directory for VM storage: home directory is empty")
+	}
+	return filepath.Join(home, ".local", "share", "bunn-burrow", "vms"), nil
+}
+
+// vmDir returns the per-VM working directory. WorkDir must already be resolved
+// to an explicit or user-home-based VM storage directory by New.
+func (c Config) vmDir(id string) string {
+	return filepath.Join(c.WorkDir, id)
 }
 
 // Resources returns the filesystem paths owned by a VM instance.

@@ -113,6 +113,7 @@ func testConfig(t *testing.T) Config {
 	c := DefaultConfig()
 	c.KernelImage = "/dev/null"
 	c.RootFS = "/dev/null"
+	c.WorkDir = t.TempDir()
 	return c
 }
 
@@ -186,8 +187,9 @@ func TestConfigValidate(t *testing.T) {
 }
 
 func TestVMNew(t *testing.T) {
-	vm, err := New(testConfig(&testing.T{}), nil)
+	vm, err := New(testConfig(t), nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, vm.Destroy(context.Background())) })
 	require.NotEmpty(t, vm.ID())
 	require.Equal(t, StateCreated, vm.State())
 	require.Equal(t, vm.ID(), filepath.Base(vm.Dir()))
@@ -198,15 +200,69 @@ func TestVMNew(t *testing.T) {
 }
 
 func TestVMNewWithID(t *testing.T) {
-	c := testConfig(&testing.T{})
+	c := testConfig(t)
 	c.ID = "my-vm"
 	vm, err := New(c, nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, vm.Destroy(context.Background())) })
 	require.Equal(t, "my-vm", vm.ID())
 }
 
+func TestVMDefaultWorkDirUsesUserDataDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	c := testConfig(t)
+	c.WorkDir = ""
+	vm, err := New(c, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, vm.Destroy(context.Background())) })
+
+	expectedBase := filepath.Join(home, ".local", "share", "bunn-burrow", "vms")
+	require.Equal(t, filepath.Join(expectedBase, vm.ID()), vm.Dir())
+	baseInfo, err := os.Stat(expectedBase)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0700), baseInfo.Mode().Perm())
+}
+
+func TestVMWorkDirIsExclusiveAndScoped(t *testing.T) {
+	base := t.TempDir()
+	externalFile := filepath.Join(base, "keep.txt")
+	require.NoError(t, os.WriteFile(externalFile, []byte("keep"), 0600))
+
+	c := testConfig(t)
+	c.WorkDir = base
+	c.ID = "scoped-vm"
+	vm, err := New(c, nil)
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(base, c.ID), vm.Dir())
+	require.ErrorContains(t, os.Mkdir(vm.Dir(), 0700), "file exists")
+	require.NoError(t, vm.Destroy(context.Background()))
+
+	data, err := os.ReadFile(externalFile)
+	require.NoError(t, err)
+	require.Equal(t, "keep", string(data))
+	_, err = os.Stat(vm.Dir())
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	_, err = New(c, nil)
+	require.NoError(t, err)
+}
+
+func TestVMRejectsUnsafeWorkDirAndID(t *testing.T) {
+	c := testConfig(t)
+	c.WorkDir = string(os.PathSeparator)
+	_, err := New(c, nil)
+	require.ErrorContains(t, err, "cannot be the filesystem root")
+
+	c.WorkDir = t.TempDir()
+	c.ID = "../outside"
+	_, err = New(c, nil)
+	require.ErrorContains(t, err, "must be a single path component")
+}
+
 func TestPauseResumeWithFakeAPI(t *testing.T) {
-	vm, err := New(testConfig(&testing.T{}), nil)
+	vm, err := New(testConfig(t), nil)
 	require.NoError(t, err)
 	require.NoError(t, vm.sm.Transition(StateCreated, StatePreparing))
 	require.NoError(t, vm.sm.Transition(StatePreparing, StateRunning))
@@ -222,15 +278,16 @@ func TestPauseResumeWithFakeAPI(t *testing.T) {
 }
 
 func TestPauseRejectsNonRunning(t *testing.T) {
-	vm, err := New(testConfig(&testing.T{}), nil)
+	vm, err := New(testConfig(t), nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, vm.Destroy(context.Background())) })
 	ctx := context.Background()
 	require.Error(t, vm.Pause(ctx)) // Created -> not Running
 	require.Equal(t, StateCreated, vm.State())
 }
 
 func TestStopWithNoProcessTimesOut(t *testing.T) {
-	c := testConfig(&testing.T{})
+	c := testConfig(t)
 	c.StopTimeout = 100 * time.Millisecond
 	c.StopGraceTimeout = 100 * time.Millisecond
 	vm, err := New(c, nil)
@@ -375,8 +432,9 @@ func TestCopyFile(t *testing.T) {
 }
 
 func TestForkRequiresPaused(t *testing.T) {
-	vm, err := New(testConfig(&testing.T{}), nil)
+	vm, err := New(testConfig(t), nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, vm.Destroy(context.Background())) })
 	_, err = vm.Fork(context.Background(), ForkOpts{CopyRootFS: true})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "paused")

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/omkar/sandbox/internal/envcache"
@@ -252,6 +251,10 @@ func (p *Preparer) Prepare(ctx context.Context, ref *image.Reference, guestAgent
 			return nil, err
 		}
 	}
+	if err := builder.Finalize(); err != nil {
+		complete(fmt.Errorf("finalize rootfs permissions: %w", err), nil)
+		return nil, err
+	}
 
 	// Build ext4 image from the extracted rootfs.
 	safeKey := envcache.SafeCacheKey(cacheKey)
@@ -363,7 +366,6 @@ func injectGuestAgent(rootDir, agentPath string) error {
 }
 
 // buildExt4Image creates an ext4 filesystem image from a directory tree.
-// It uses mkfs.ext4 to create the image and debugfs (batched) to populate it.
 func buildExt4Image(srcDir, dstPath string) error {
 	// Estimate required size: walk directory and sum file sizes, add 50% headroom.
 	var totalSize int64
@@ -387,84 +389,11 @@ func buildExt4Image(srcDir, dstPath string) error {
 	// Convert to 1K blocks for mkfs.ext4.
 	sizeKB := imageSize / 1024
 
-	// Create the ext4 image.
-	cmd := exec.Command("mkfs.ext4", "-q", "-F", "-O", "^has_journal", dstPath, fmt.Sprintf("%d", sizeKB))
+	// Populate directly from the directory tree so names and symlink targets
+	// never become commands in a debugfs script.
+	cmd := exec.Command("mkfs.ext4", "-q", "-F", "-O", "^has_journal", "-d", srcDir, dstPath, fmt.Sprintf("%d", sizeKB))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("mkfs.ext4: %w\noutput: %s", err, string(output))
 	}
-
-	// Batch all debugfs commands into a single session for speed.
-	return populateExt4Batch(dstPath, srcDir, "/")
-}
-
-// populateExt4Batch walks the directory tree, collects debugfs commands,
-// and executes them in a single debugfs session.
-// Directories are created first, then symlinks, then files, to ensure
-// symlink targets exist before symlinks are created.
-func populateExt4Batch(imagePath, srcDir, dstPath string) error {
-	var mkdirs []string
-	var symlinks []string
-	var writes []string
-
-	var walkFn func(sDir, dPath string) error
-	walkFn = func(sDir, dPath string) error {
-		entries, err := os.ReadDir(sDir)
-		if err != nil {
-			return fmt.Errorf("read dir %s: %w", sDir, err)
-		}
-		for _, e := range entries {
-			srcPath := filepath.Join(sDir, e.Name())
-			dst := filepath.Join(dPath, e.Name())
-			dst = strings.ReplaceAll(dst, "\\", "/")
-
-			if e.IsDir() {
-				mkdirs = append(mkdirs, fmt.Sprintf("mkdir %s", dst))
-				if err := walkFn(srcPath, dst); err != nil {
-					return err
-				}
-			} else if e.Type()&os.ModeSymlink != 0 {
-				target, err := os.Readlink(srcPath)
-				if err != nil {
-					return fmt.Errorf("readlink %s: %w", srcPath, err)
-				}
-				symlinks = append(symlinks, fmt.Sprintf("symlink %s %s", dst, target))
-			} else {
-				writes = append(writes, fmt.Sprintf("write %s %s", srcPath, dst))
-			}
-		}
-		return nil
-	}
-
-	if err := walkFn(srcDir, dstPath); err != nil {
-		return err
-	}
-
-	// Build command sequence: directories first, then symlinks, then files.
-	var cmds []string
-	cmds = append(cmds, mkdirs...)
-	cmds = append(cmds, symlinks...)
-	cmds = append(cmds, writes...)
-
-	// Write commands to a temp file.
-	tmpFile, err := os.CreateTemp("", "bunn-debugfs-cmds-*")
-	if err != nil {
-		return fmt.Errorf("create debugfs command file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	for _, cmd := range cmds {
-		if _, err := fmt.Fprintln(tmpFile, cmd); err != nil {
-			tmpFile.Close()
-			return fmt.Errorf("write debugfs command: %w", err)
-		}
-	}
-	tmpFile.Close()
-
-	// Run debugfs once with all commands.
-	cmd := exec.Command("debugfs", "-w", "-f", tmpFile.Name(), imagePath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("debugfs batch: %w\noutput: %s", err, string(output))
-	}
-
 	return nil
 }

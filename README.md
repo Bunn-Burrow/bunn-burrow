@@ -62,51 +62,56 @@ bunn-burrow/
 ### 1. Build the host application
 
 ```bash
-cd /home/omkar/sandbox
-go build -o bunn-burrow .
+cd ~/bunn-burrow
+mkdir -p bin
+GOWORK=off go build -o bin/bunn-burrow .
 ```
 
 ### 2. Build the Guest Agent
 
 ```bash
-cd /home/omkar/sandbox/guest-agent
-CGO_ENABLED=0 go build -o bin/guest-agent-static ./cmd/guest-agent
+cd ~/bunn-burrow
+(cd guest-agent && GOWORK=off CGO_ENABLED=0 go build -o ../bin/guest-agent-static ./cmd/guest-agent)
 ```
 
 ### 3. Prepare an OCI environment (first run)
 
 ```bash
-# Prepare Alpine 3.24 environment
-/tmp/bunn-prepare \
-  --kernel /home/omkar/.local/firecracker/vmlinux \
-  --rootfs /path/to/alpine-rootfs.ext4 \
-  --workdir /tmp/bunn-burrow-work \
-  --bin /home/omkar/.local/bin/firecracker
+# Build the preparation harness and prepare Alpine 3.24
+GOWORK=off go build -o bin/bunn-prepare-harness ./cmd/prepare
+./bin/bunn-prepare-harness \
+  --cache-dir "$HOME/.cache/bunn-burrow" \
+  --guest-agent bin/guest-agent-static \
+  --kernel "$HOME/.local/firecracker/vmlinux" \
+  --workdir bin/work \
+  --bin "$HOME/.local/bin/firecracker"
 ```
 
 The prepared environment is cached. Subsequent preparations of the same image are cache hits.
 
-### 5. Build the bunn CLI (optional)
+### 4. Build the bunn CLI (optional)
 
 ```bash
-cd bunn-cli
-make build
+(cd bunn-cli && GOWORK=off go build -o ../bin/bunn ./cmd/bunn)
 ```
 
 The binary is named `bunn` and provides developer-facing commands for VM lifecycle,
 configuration, and runtime diagnostics. See [bunn-cli/README.md](bunn-cli/README.md)
 for full CLI documentation.
 
-### 4. Execute a workload
+### 5. Execute a workload
 
 ```bash
-cd /home/omkar/sandbox
-FIRECRACKER_KERNEL=/home/omkar/.local/firecracker/vmlinux \
-FIRECRACKER_ROOTFS=/path/to/rootfs.ext4 \
-FIRECRACKER_WORKDIR=/tmp/bunn-burrow-work \
-FIRECRACKER_BIN=/home/omkar/.local/bin/firecracker \
-./bunn-burrow exec test-vm /bin/busybox echo "Hello from Firecracker"
+cd ~/bunn-burrow
+FIRECRACKER_KERNEL="$HOME/.local/firecracker/vmlinux" \
+FIRECRACKER_ROOTFS="/path/to/prepared-rootfs.ext4" \
+FIRECRACKER_WORKDIR="$PWD/bin/work" \
+FIRECRACKER_BIN="$HOME/.local/bin/firecracker" \
+  ./bin/bunn-burrow exec test-vm /bin/busybox echo "Hello from Firecracker"
 ```
+
+`/path/to/prepared-rootfs.ext4` must be replaced with the actual rootfs path
+reported by the preparation harness.
 
 ## Detailed Documentation
 
@@ -116,6 +121,7 @@ FIRECRACKER_BIN=/home/omkar/.local/bin/firecracker \
 - [docs/architecture.md](docs/architecture.md) - Architecture details
 - [docs/runtime-guide.md](docs/runtime-guide.md) - Running workloads by runtime
 - [docs/troubleshooting.md](docs/troubleshooting.md) - Common issues and fixes
+- [docs/COMMANDS.md](docs/COMMANDS.md) - Verified command manual, feature status, and limitations
 - [bunn-cli/README.md](bunn-cli/README.md) - CLI build, configuration, and command reference
 
 ## bunn CLI Reference
@@ -166,14 +172,15 @@ the full development workflow, coding standards, and pull request process.
 
 ## Current Limitations
 
-- Guest Agent must be manually injected into OCI rootfs during preparation
-- No guest networking (vsock only for host↔guest communication)
+- Guest Agent must be injected into the OCI rootfs during preparation
+- Guest networking is not end-to-end verified; vsock is the verified host-to-guest channel
 - Each workload execution boots a new Firecracker VM
-- `vmm/sandbox.go` uses a different (incompatible) protocol; use the `exec` command in `main.go` instead
+- CLI VM and agent state is in-memory and cannot be managed by a later CLI invocation
+- Volume guest formatting/mounting, template-backed runtime, and snapshot restore are not fully verified
 
 ## Milestone 4, 5, 6, 7 & 8: Templates, COW Storage, Snapshot/Restore, Lifecycle Management & Runtime Reliability
 
-**Status: Implemented**
+**Implementation status: APIs are present; end-to-end verification is incomplete.**
 
 M4 adds reusable, immutable VM templates. M5 replaces the full per-VM rootfs
 copy with a copy-on-write storage engine using qcow2 backing images and
@@ -193,5 +200,7 @@ enhanced crash recovery.
 - **Backward compatible**: direct rootfs creation (`Config.RootFS` without `TemplateID`) is preserved. Legacy `Fork`/`restoreVM` API preserved.
 
 See `docs/architecture.md` (M5/M6/M7/M8 sections) and `docs/run.md` (M5/M6/M7/M8 usage) for details.
+These milestone descriptions summarize code paths, not verified user workflows.
+For tested commands and explicit limitations, see [docs/COMMANDS.md](docs/COMMANDS.md).
 
 **Deferred to M9:** automatic VM resumption after crash, `filesystem_consistent` snapshots with safe guest freeze/thaw, application-consistent snapshots, a persistent CLI/SDK, runtime metrics collection.

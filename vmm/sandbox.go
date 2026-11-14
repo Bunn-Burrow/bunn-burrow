@@ -1313,11 +1313,10 @@ func (sess *Session) ReceiveOutput(ctx context.Context) ([]byte, error) {
 // Resize changes the terminal dimensions of the session.
 func (sess *Session) Resize(rows, cols uint16) error {
 	sess.mu.Lock()
+	defer sess.mu.Unlock()
 	if sess.conn == nil {
-		sess.mu.Unlock()
 		return errors.New("session is closed")
 	}
-	sess.mu.Unlock()
 
 	req := map[string]any{
 		"kind":       "session_resize",
@@ -1479,8 +1478,14 @@ func (sess *Session) Terminate(ctx context.Context) error {
 		return fmt.Errorf("write session terminate payload: %w", err)
 	}
 
-	// Wait for session_finished or connection close.
-	<-sess.done
+	// Wait for session_finished or connection close without allowing cleanup to
+	// hang forever if the guest stops responding.
+	select {
+	case <-sess.done:
+	case <-ctx.Done():
+		_ = conn.Close()
+		return fmt.Errorf("wait for terminal session to finish: %w", ctx.Err())
+	}
 
 	_ = conn.Close()
 	return nil

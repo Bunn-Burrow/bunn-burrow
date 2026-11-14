@@ -105,11 +105,20 @@ func buildVMMConfigFromViper(v *config.Loader, vmID string) (vmm.Config, error) 
 		if gwStr != "" {
 			gw = net.ParseIP(gwStr)
 		}
+		dns := make([]net.IP, 0)
+		for _, value := range v.Viper().GetStringSlice(config.KeyNetworkDNS) {
+			server := net.ParseIP(value).To4()
+			if server == nil {
+				return vmm.Config{}, fmt.Errorf("invalid IPv4 DNS server %q", value)
+			}
+			dns = append(dns, append(net.IP(nil), server...))
+		}
 		vmmCfg.Network = &vmm.NetworkConfig{
 			Enabled:      true,
 			Bridge:       v.Viper().GetString(config.KeyNetworkBridge),
 			CIDR:         v.Viper().GetString(config.KeyNetworkCIDR),
 			Gateway:      gw,
+			DNS:          dns,
 			NATInterface: v.Viper().GetString(config.KeyNetworkNATInterface),
 			Firewall:     v.Viper().GetBool(config.KeyNetworkFirewall),
 			MTU:          v.Viper().GetInt(config.KeyNetworkMTU),

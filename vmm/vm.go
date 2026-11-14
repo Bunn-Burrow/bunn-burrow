@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -103,6 +104,24 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 	if id == "" {
 		id = uuid.NewString()
 	}
+	if id == "." || id == ".." || filepath.Base(id) != id {
+		return nil, fmt.Errorf("invalid VM ID %q: must be a single path component", id)
+	}
+	if cfg.WorkDir == "" {
+		workDir, err := defaultVMWorkDir()
+		if err != nil {
+			return nil, err
+		}
+		cfg.WorkDir = workDir
+	}
+	if filepath.Clean(cfg.WorkDir) == string(os.PathSeparator) {
+		return nil, errors.New("VM work directory cannot be the filesystem root")
+	}
+	workDir, err := filepath.Abs(cfg.WorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve VM work directory %q: %w", cfg.WorkDir, err)
+	}
+	cfg.WorkDir = workDir
 
 	vm := &VM{
 		id:     id,
@@ -139,9 +158,13 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 		vm.TemplateManager = cfg.TemplateManager
 	}
 
-	// Create the VM's private working directory so Firecracker can place its
-	// API socket and other per-VM artifacts there.
-	if err := os.MkdirAll(vm.res.Dir, 0750); err != nil {
+	// Create the user-owned VM storage base and an exclusive per-VM directory.
+	// The exclusive mkdir prevents a reused ID from adopting or later deleting
+	// files belonging to an earlier VM.
+	if err := os.MkdirAll(cfg.WorkDir, 0700); err != nil {
+		return nil, fmt.Errorf("create VM storage directory %q: %w", cfg.WorkDir, err)
+	}
+	if err := os.Mkdir(vm.res.Dir, 0700); err != nil {
 		return nil, fmt.Errorf("create VM working directory: %w", err)
 	}
 	return vm, nil
@@ -193,7 +216,7 @@ func (vm *VM) Snapshot() *SnapshotInfo {
 // then configure devices (machine config, boot source, root disk), configure vsock,
 // and finally issue InstanceStart. On any failure the process is terminated and the
 // VM transitions to Failed. Never reports the VM as running before startup succeeds.
-func (vm *VM) Start(ctx context.Context) error {
+func (vm *VM) Start(ctx context.Context) (startErr error) {
 	if err := vm.sm.Transition(StateCreated, StatePreparing); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
@@ -217,7 +240,12 @@ func (vm *VM) Start(ctx context.Context) error {
 		}
 		if networkAllocated && vm.State() != StateRunning {
 			if err := vm.releaseNetwork(); err != nil {
-				vm.logger.WithError(err).Warn("release network on startup failure")
+				startErr = errors.Join(startErr, fmt.Errorf("release network on startup failure: %w", err))
+			}
+		}
+		if vm.State() != StateRunning && vm.ownNetworkMgr {
+			if err := vm.shutDownNetworkMgr(); err != nil {
+				startErr = errors.Join(startErr, fmt.Errorf("shutdown network after startup failure: %w", err))
 			}
 		}
 		if volumesAttached && vm.State() != StateRunning {
@@ -246,19 +274,18 @@ func (vm *VM) Start(ctx context.Context) error {
 		layerCreated = true
 	}
 
-	if err := vm.startProcessAndWait(ctx); err != nil {
-		vm.sm.TransitionTo(StateFailed)
-		return err
-	}
-
-	// Allocate network resources (TAP, IP, bridge port, firewall rules) before
-	// device configuration so the TAP path is available to Firecracker.
+	// Allocate host network resources before starting Firecracker so privileged
+	// setup failures are reported before the VM process is launched.
 	if err := vm.allocateNetwork(ctx); err != nil {
-		vm.stopProcLocked()
 		vm.sm.TransitionTo(StateFailed)
 		return fmt.Errorf("allocate network: %w", err)
 	}
 	networkAllocated = true
+
+	if err := vm.startProcessAndWait(ctx); err != nil {
+		vm.sm.TransitionTo(StateFailed)
+		return err
+	}
 
 	// Attach persistent volumes before device configuration so their NBD
 	// block devices are available when Firecracker configures drives.
@@ -372,6 +399,16 @@ func (vm *VM) configureDevices(ctx context.Context) error {
 	if bootArgs == "" {
 		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=ext4 rootwait rw init=/sbin/bunn-agent"
 	}
+	if vm.network != nil {
+		if strings.Contains(bootArgs, "bunn_net=") {
+			return fmt.Errorf("boot arguments already contain bunn_net configuration")
+		}
+		networkArg, err := vm.networkBootArg()
+		if err != nil {
+			return err
+		}
+		bootArgs = strings.TrimSpace(bootArgs) + " " + networkArg
+	}
 	if err := vm.api.PutGuestBootSource(ctx, &models.BootSource{
 		KernelImagePath: &vm.cfg.KernelImage,
 		BootArgs:        bootArgs,
@@ -412,7 +449,7 @@ func (vm *VM) configureDevices(ctx context.Context) error {
 	if n := vm.network; n != nil {
 		if err := vm.api.PutGuestNetworkInterfaceByID(ctx, n.IfaceID, &models.NetworkInterface{
 			GuestMac:    n.MAC.String(),
-			HostDevName: &n.TapDevice,
+			HostDevName: &n.TapName,
 			IfaceID:     &n.IfaceID,
 		}); err != nil {
 			return fmt.Errorf("configure network interface: %w", err)
@@ -420,6 +457,60 @@ func (vm *VM) configureDevices(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (vm *VM) networkBootArg() (string, error) {
+	if vm.network == nil || vm.network.Subnet == nil {
+		return "", fmt.Errorf("VM network is missing subnet information")
+	}
+	prefix, bits := vm.network.Subnet.Mask.Size()
+	if bits != 32 || vm.network.IP.To4() == nil || vm.network.Gateway.To4() == nil {
+		return "", fmt.Errorf("VM network must have IPv4 address, gateway, and subnet")
+	}
+	if !validGuestInterfaceName(vm.network.Interface) {
+		return "", fmt.Errorf("invalid guest interface name %q", vm.network.Interface)
+	}
+	if len(vm.network.MAC) != 6 {
+		return "", fmt.Errorf("VM network MAC address must contain 6 bytes")
+	}
+	if vm.network.MTU < 576 || vm.network.MTU > 65535 {
+		return "", fmt.Errorf("invalid VM network MTU %d", vm.network.MTU)
+	}
+	if len(vm.network.DNS) == 0 {
+		return "", fmt.Errorf("VM network has no DNS servers")
+	}
+	dns := make([]string, len(vm.network.DNS))
+	for i, server := range vm.network.DNS {
+		if server.To4() == nil {
+			return "", fmt.Errorf("VM network DNS server %q is not IPv4", server)
+		}
+		dns[i] = server.String()
+	}
+	return fmt.Sprintf(
+		"bunn_net=%s|%s|%s/%d|%s|%s|%d",
+		vm.network.Interface,
+		vm.network.MAC.String(),
+		vm.network.IP.To4(),
+		prefix,
+		vm.network.Gateway.To4(),
+		strings.Join(dns, ";"),
+		vm.network.MTU,
+	), nil
+}
+
+func validGuestInterfaceName(name string) bool {
+	if name == "" || len(name) > 15 {
+		return false
+	}
+	for _, char := range name {
+		if !(char >= 'a' && char <= 'z') &&
+			!(char >= 'A' && char <= 'Z') &&
+			!(char >= '0' && char <= '9') &&
+			char != '_' && char != '-' && char != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 // configureVsock configures the vsock device using this VM's unique socket path
@@ -455,12 +546,13 @@ func (vm *VM) allocateNetwork(ctx context.Context) error {
 		return fmt.Errorf("network manager not configured")
 	}
 
-	if err := mgr.Initialize(); err != nil {
-		return fmt.Errorf("initialize network manager: %w", err)
-	}
-
 	n, err := mgr.Allocate(vm.id)
 	if err != nil {
+		if vm.ownNetworkMgr {
+			if cleanupErr := mgr.Shutdown(); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("shutdown network after allocation failure: %w", cleanupErr))
+			}
+		}
 		return err
 	}
 	vm.network = n
@@ -472,7 +564,6 @@ func (vm *VM) allocateNetwork(ctx context.Context) error {
 func (vm *VM) releaseNetwork() error {
 	vm.mu.Lock()
 	n := vm.network
-	vm.network = nil
 	vm.mu.Unlock()
 
 	if n == nil {
@@ -481,9 +572,17 @@ func (vm *VM) releaseNetwork() error {
 
 	mgr := vm.NetworkManager
 	if mgr == nil {
-		return nil
+		return fmt.Errorf("release VM network: network manager is missing")
 	}
-	return mgr.Release(vm.id)
+	if err := mgr.Release(vm.id); err != nil {
+		return err
+	}
+	vm.mu.Lock()
+	if vm.network == n {
+		vm.network = nil
+	}
+	vm.mu.Unlock()
+	return nil
 }
 
 // shutDownNetworkMgr shuts down an owned network manager, releasing shared
@@ -763,8 +862,10 @@ func (vm *VM) Stop(ctx context.Context) error {
 			vm.logger.WithError(err).Warn("runtime release during stop")
 		}
 
+		var networkReleaseErr error
 		if err := vm.releaseNetwork(); err != nil {
 			vm.logger.WithError(err).Warn("network release during stop")
+			networkReleaseErr = fmt.Errorf("stop: release network: %w", err)
 		}
 
 		if err := vm.detachVolumes(); err != nil {
@@ -778,7 +879,7 @@ func (vm *VM) Stop(ctx context.Context) error {
 		}
 
 		vm.logger.Info("VM stopped")
-		return nil
+		return networkReleaseErr
 	}
 
 	// If we reach here, SIGKILL was sent but the process has not been reaped.
@@ -896,7 +997,7 @@ func (vm *VM) releaseRuntime() error {
 	return errors.Join(errs...)
 }
 
-// removeOwnedArtifacts removes the VM's private working directory contents.
+// removeOwnedArtifacts removes the VM's private working directory and contents.
 // Shared kernel and rootfs images are never removed.
 func (vm *VM) removeOwnedArtifacts() error {
 	dir := vm.res.Dir
@@ -916,6 +1017,9 @@ func (vm *VM) removeOwnedArtifacts() error {
 		if err := os.RemoveAll(p); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

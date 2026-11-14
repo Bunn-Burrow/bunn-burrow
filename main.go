@@ -22,8 +22,21 @@ import (
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		var exitErr *guestExitCodeError
+		if errors.As(err, &exitErr) {
+			log.Print(err)
+			os.Exit(exitErr.code)
+		}
 		log.Fatal(err)
 	}
+}
+
+type guestExitCodeError struct {
+	code int
+}
+
+func (e *guestExitCodeError) Error() string {
+	return fmt.Sprintf("guest process exited with status %d", e.code)
 }
 
 func run(args []string) error {
@@ -310,8 +323,13 @@ func execCmd(ctx context.Context, cfg vmm.Config, args []string) (runErr error) 
 	execID := "exec-" + vmID
 	timeout := 30 * time.Second
 
+	var executionErr error
 	if err := sendExecute(ctx, vm, cfg.VsockPort, execID, command, cmdArgs, nil, "", "", timeout); err != nil {
-		return fmt.Errorf("execute: %w", err)
+		var exitErr *guestExitCodeError
+		if !errors.As(err, &exitErr) {
+			return fmt.Errorf("execute: %w", err)
+		}
+		executionErr = err
 	}
 
 	// Stop the VM after execution.
@@ -319,6 +337,10 @@ func execCmd(ctx context.Context, cfg vmm.Config, args []string) (runErr error) 
 	defer stopCancel()
 	if err := vm.Stop(stopCtx); err != nil {
 		return fmt.Errorf("stop VM: %w", err)
+	}
+
+	if executionErr != nil {
+		return fmt.Errorf("execute: %w", executionErr)
 	}
 
 	return nil
@@ -450,9 +472,17 @@ func sendExecute(ctx context.Context, vm *vmm.VM, port uint32, execID, command s
 					os.Stdout.Write([]byte(data))
 				}
 			case "execution_finished":
-				exitCode, _ := resp["exit_code"].(float64)
+				exitCode, ok := resp["exit_code"].(float64)
+				if !ok || exitCode < 0 || exitCode > 255 || exitCode != float64(int(exitCode)) {
+					done <- fmt.Errorf("guest returned invalid exit code %v", resp["exit_code"])
+					return
+				}
 				log.Printf("execution finished: id=%s exit_code=%.0f", execID, exitCode)
-				done <- nil
+				if exitCode != 0 {
+					done <- &guestExitCodeError{code: int(exitCode)}
+				} else {
+					done <- nil
+				}
 				return
 			case "error":
 				msg, _ := resp["message"].(string)

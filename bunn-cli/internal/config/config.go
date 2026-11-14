@@ -40,13 +40,14 @@ type RuntimeConfig struct {
 
 // NetworkConfig holds VM networking settings.
 type NetworkConfig struct {
-	Enabled      bool   `yaml:"enabled" mapstructure:"enabled"`
-	Bridge       string `yaml:"bridge" mapstructure:"bridge"`
-	CIDR         string `yaml:"cidr" mapstructure:"cidr"`
-	Gateway      string `yaml:"gateway" mapstructure:"gateway"`
-	NATInterface string `yaml:"nat_interface" mapstructure:"nat_interface"`
-	Firewall     bool   `yaml:"firewall" mapstructure:"firewall"`
-	MTU          int    `yaml:"mtu" mapstructure:"mtu"`
+	Enabled      bool     `yaml:"enabled" mapstructure:"enabled"`
+	Bridge       string   `yaml:"bridge" mapstructure:"bridge"`
+	CIDR         string   `yaml:"cidr" mapstructure:"cidr"`
+	Gateway      string   `yaml:"gateway" mapstructure:"gateway"`
+	DNS          []string `yaml:"dns" mapstructure:"dns"`
+	NATInterface string   `yaml:"nat_interface" mapstructure:"nat_interface"`
+	Firewall     bool     `yaml:"firewall" mapstructure:"firewall"`
+	MTU          int      `yaml:"mtu" mapstructure:"mtu"`
 }
 
 // StorageConfig holds storage settings.
@@ -85,6 +86,7 @@ const (
 	KeyNetworkBridge         = "network.bridge"
 	KeyNetworkCIDR           = "network.cidr"
 	KeyNetworkGateway        = "network.gateway"
+	KeyNetworkDNS            = "network.dns"
 	KeyNetworkNATInterface   = "network.nat_interface"
 	KeyNetworkFirewall       = "network.firewall"
 	KeyNetworkMTU            = "network.mtu"
@@ -275,6 +277,7 @@ func String(cfg Config) string {
 	b.WriteString(fmt.Sprintf("  bridge: %s\n", cfg.Network.Bridge))
 	b.WriteString(fmt.Sprintf("  cidr: %s\n", cfg.Network.CIDR))
 	b.WriteString(fmt.Sprintf("  gateway: %s\n", cfg.Network.Gateway))
+	b.WriteString(fmt.Sprintf("  dns: %s\n", strings.Join(cfg.Network.DNS, ",")))
 	b.WriteString(fmt.Sprintf("  nat_interface: %s\n", cfg.Network.NATInterface))
 	b.WriteString(fmt.Sprintf("  firewall: %v\n", cfg.Network.Firewall))
 	b.WriteString(fmt.Sprintf("  mtu: %d\n", cfg.Network.MTU))

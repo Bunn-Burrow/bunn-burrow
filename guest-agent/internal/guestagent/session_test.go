@@ -3,6 +3,7 @@ package guestagent
 import (
 	"errors"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -107,6 +108,37 @@ func TestSessionManagerPTY(t *testing.T) {
 		require.NoError(t, sm.Remove("sess-pty"))
 	})
 
+	t.Run("session process has a controlling terminal", func(t *testing.T) {
+		_, err := sm.StartSession(
+			"sess-ctty",
+			"/bin/sh",
+			[]string{"-c", "test -t 0 && printf tty-ok; stty size"},
+			[]string{"PATH=/usr/bin:/bin"},
+			"",
+			TerminalSize{Rows: 23, Cols: 81},
+			0,
+		)
+		require.NoError(t, err)
+
+		outputCh, err := sm.ReceiveOutput("sess-ctty")
+		require.NoError(t, err)
+		var output []byte
+		for {
+			select {
+			case chunk, ok := <-outputCh:
+				if !ok {
+					require.Contains(t, string(output), "tty-ok")
+					require.Contains(t, string(output), "23 81")
+					require.NoError(t, sm.Remove("sess-ctty"))
+					return
+				}
+				output = append(output, chunk...)
+			case <-time.After(5 * time.Second):
+				t.Fatal("terminal command did not finish")
+			}
+		}
+	})
+
 	t.Run("resize session", func(t *testing.T) {
 		_, err := sm.StartSession("sess-resize", "sleep", []string{"100"}, nil, "", TerminalSize{Rows: 24, Cols: 80}, 0)
 		require.NoError(t, err)
@@ -123,11 +155,14 @@ func TestSessionManagerPTY(t *testing.T) {
 	})
 
 	t.Run("terminate session", func(t *testing.T) {
-		info, err := sm.StartSession("sess-term", "sleep", []string{"100"}, nil, "", TerminalSize{}, 0)
+		info, err := sm.StartSession("sess-term", "/bin/sh", []string{"-c", "sleep 100"}, nil, "", TerminalSize{}, 0)
 		require.NoError(t, err)
 		require.NotZero(t, info.PID)
 
 		require.NoError(t, sm.Terminate("sess-term"))
+		require.Eventually(t, func() bool {
+			return errors.Is(syscall.Kill(-info.PID, 0), syscall.ESRCH)
+		}, time.Second, 10*time.Millisecond)
 
 		// After terminate, status should return not found.
 		_, err = sm.Status("sess-term")

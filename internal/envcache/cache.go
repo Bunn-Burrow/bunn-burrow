@@ -100,13 +100,19 @@ func (c *EnvironmentCache) getFromDisk(cacheKey string) *Environment {
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil
 	}
-	// Verify the rootfs still exists.
-	if _, err := os.Stat(env.RootfsPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil // rootfs missing, treat as not cached
-		}
+	if _, err := os.Stat(env.RootfsPath); err == nil {
+		return &env
+	} else if !os.IsNotExist(err) {
 		return nil
 	}
+
+	// Older cache metadata may contain a rootfs path from a previous checkout
+	// or cache location. Recover it from the current cache's canonical base dir.
+	relocated := filepath.Join(filepath.Dir(c.dir), "base", safeCacheKey(cacheKey), "rootfs.ext4")
+	if _, err := os.Stat(relocated); err != nil {
+		return nil
+	}
+	env.RootfsPath = relocated
 	return &env
 }
 

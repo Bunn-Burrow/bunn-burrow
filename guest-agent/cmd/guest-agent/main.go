@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -36,6 +37,18 @@ func main() {
 		if err := syscall.Mount(m[0], target, m[2], 0, ""); err != nil {
 			log.Printf("mount %s on %s: %v", m[0], target, err)
 		}
+	}
+	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755"); err != nil && !errors.Is(err, syscall.EBUSY) {
+		log.Printf("mount devtmpfs on /dev: %v", err)
+	}
+	if err := os.MkdirAll("/dev/pts", 0o755); err != nil {
+		log.Printf("mkdir /dev/pts: %v", err)
+	}
+	if err := syscall.Mount("devpts", "/dev/pts", "devpts", syscall.MS_NOSUID|syscall.MS_NOEXEC, "gid=5,mode=620,ptmxmode=666"); err != nil {
+		log.Printf("mount devpts on /dev/pts: %v", err)
+	}
+	if err := guestagent.ConfigureNetworkFromCmdline("/proc/cmdline"); err != nil {
+		log.Fatalf("configure guest network: %v", err)
 	}
 
 	agent := guestagent.New()

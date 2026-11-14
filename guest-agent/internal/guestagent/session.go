@@ -120,13 +120,18 @@ func (sm *SessionManager) StartSession(id, cmd string, args []string, env []stri
 		return nil, fmt.Errorf("open ptmx: %w", err)
 	}
 
-	// Get the slave device name from the master's minor number (/dev/pts/N).
-	var stat unix.Stat_t
-	if err := unix.Fstat(masterFd, &stat); err != nil {
+	ptyNumber, err := unix.IoctlGetInt(masterFd, unix.TIOCGPTN)
+	if err != nil {
 		unix.Close(masterFd)
-		return nil, fmt.Errorf("fstat ptmx: %w", err)
+		return nil, fmt.Errorf("get PTY number: %w", err)
 	}
-	slaveName := fmt.Sprintf("/dev/pts/%d", stat.Rdev&0xff)
+	unlock := int32(0)
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(masterFd), uintptr(unix.TIOCSPTLCK), uintptr(unsafe.Pointer(&unlock)))
+	if errno != 0 {
+		unix.Close(masterFd)
+		return nil, fmt.Errorf("unlock PTY slave: %w", errno)
+	}
+	slaveName := fmt.Sprintf("/dev/pts/%d", ptyNumber)
 
 	// Open the slave side.
 	slaveFd, err := unix.Open(slaveName, unix.O_RDWR|unix.O_CLOEXEC, 0)
@@ -159,7 +164,9 @@ func (sm *SessionManager) StartSession(id, cmd string, args []string, env []stri
 	command.Stdout = os.NewFile(uintptr(slaveFd), "pty-slave")
 	command.Stderr = os.NewFile(uintptr(slaveFd), "pty-slave")
 	command.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Create a new session so the process is the session leader
+		Setsid:  true,
+		Setctty: true,
+		Ctty:    0,
 	}
 
 	if err := command.Start(); err != nil {
@@ -312,22 +319,32 @@ func (sm *SessionManager) Terminate(id string) error {
 	delete(sm.sessions, id)
 	sm.mu.Unlock()
 
+	pid := session.cmd.Process.Pid
+	var errs []error
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		errs = append(errs, fmt.Errorf("send SIGTERM to session process group: %w", err))
+	}
 	session.cancel()
 
 	// Give the process a moment to terminate, then kill if needed.
 	select {
 	case <-session.doneCh:
-		// Process exited on its own.
 	case <-time.After(5 * time.Second):
-		if session.cmd.Process != nil {
-			_ = session.cmd.Process.Kill()
-		}
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		errs = append(errs, fmt.Errorf("send SIGKILL to session process group: %w", err))
+	}
+	select {
+	case <-session.doneCh:
+	case <-time.After(time.Second):
+		errs = append(errs, fmt.Errorf("session %s process did not exit after termination", id))
 	}
 
 	// Close the PTY master.
-	_ = session.closeMaster()
-
-	return nil
+	if err := session.closeMaster(); err != nil {
+		errs = append(errs, fmt.Errorf("close session PTY: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 // Detach closes the PTY connection without terminating the underlying process.
@@ -372,8 +389,12 @@ func (sm *SessionManager) pumpOutput(id string, session *procSession) {
 			copy(data, buf[:n])
 			select {
 			case session.outputCh <- data:
-			case <-session.doneCh:
-				return
+			default:
+				select {
+				case session.outputCh <- data:
+				case <-session.doneCh:
+					return
+				}
 			}
 		}
 		if err != nil {

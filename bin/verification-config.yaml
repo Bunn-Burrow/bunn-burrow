@@ -1,0 +1,24 @@
+runtime:
+    firecracker_bin: firecracker
+    kernel_path: ""
+    rootfs_path: ""
+    work_dir: ""
+    start_timeout: 10s
+    stop_timeout: 15s
+storage:
+    root_dir: /home/omkar/.local/share/bunn-burrow/storage
+    cache_dir: /home/omkar/.cache/bunn-burrow
+logging:
+    level: info
+    format: text
+output:
+    format: table
+    color: auto
+network:
+    enabled: false
+    bridge: br-bunn
+    cidr: 10.11.0.0/16
+    gateway: ""
+    nat_interface: ""
+    firewall: true
+    mtu: 1500
