@@ -17,10 +17,10 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	"github.com/Bunn-Burrow/bunn-cli/internal/cli/helpers"
-	"github.com/Bunn-Burrow/bunn-cli/internal/config"
 	"github.com/Bunn-Burrow/bunn-burrow/pkg/environment"
 	"github.com/Bunn-Burrow/bunn-burrow/vmm"
+	"github.com/Bunn-Burrow/bunn-cli/internal/cli/helpers"
+	"github.com/Bunn-Burrow/bunn-cli/internal/config"
 )
 
 func newTerminalCommand(loader *config.Loader) *cobra.Command {

@@ -7,8 +7,8 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"github.com/Bunn-Burrow/bunn-cli/internal/config"
 	"github.com/Bunn-Burrow/bunn-burrow/vmm"
+	"github.com/Bunn-Burrow/bunn-cli/internal/config"
 )
 
 func LoadVMMConfig(loader *config.Loader, flags *pflag.FlagSet, workDirFlag, vmID string) (vmm.Config, error) {
