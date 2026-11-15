@@ -6,8 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Bunn-Burrow/bunn-cli/internal/cli/helpers"
 	"github.com/Bunn-Burrow/bunn-cli/internal/config"
-	"github.com/Bunn-Burrow/bunn-cli/internal/output"
 )
 
 // newRuntimeCommand creates the `runtime` subcommand group.
@@ -41,8 +41,7 @@ qemu-nbd) rather than VM state, since there is no persistent daemon.`,
 		Example: `  bunn runtime list
   bunn runtime list --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
-			w.SetOutput(cmd.OutOrStdout(), cmd.ErrOrStderr())
+			w := helpers.NewCommandWriter(cmd)
 
 			rows := [][]string{
 				{"firecracker", checkBinary("firecracker"), binaryPath("firecracker")},
@@ -84,7 +83,7 @@ func newRuntimeInspectCommand(loader *config.Loader) *cobra.Command {
 environment variables, and defaults.`,
 		Example: `  bunn runtime inspect`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
+			w := helpers.NewCommandWriter(cmd)
 
 			cfg, err := loader.Load(path)
 			if err != nil {

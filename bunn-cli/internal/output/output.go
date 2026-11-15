@@ -61,9 +61,10 @@ type Styles struct {
 // NewWriter creates a Writer for the given format.
 func NewWriter(format Format, color string) *Writer {
 	useColor := false
-	if color == "auto" {
+	switch color {
+	case "auto":
 		useColor = isTerminal(os.Stdout) && os.Getenv("NO_COLOR") == ""
-	} else if color == "always" {
+	case "always":
 		useColor = true
 	}
 
@@ -258,32 +259,4 @@ func isTerminal(f *os.File) bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
-}
-
-// FormatDoctorStatus returns a styled status string for doctor checks.
-func FormatDoctorStatus(w *Writer, status string) string {
-	switch status {
-	case "pass":
-		if w.color {
-			return w.style.Success.Render("PASS")
-		}
-		return "PASS"
-	case "warn":
-		if w.color {
-			return w.style.Warning.Render("WARN")
-		}
-		return "WARN"
-	case "fail":
-		if w.color {
-			return w.style.Error.Render("FAIL")
-		}
-		return "FAIL"
-	case "skip":
-		if w.color {
-			return w.style.Muted.Render("SKIP")
-		}
-		return "SKIP"
-	default:
-		return status
-	}
 }

@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/omkar/sandbox/internal/storage"
-	"github.com/omkar/sandbox/internal/template"
-	vmimage "github.com/omkar/sandbox/internal/vmimage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/storage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/template"
+	vmimage "github.com/Bunn-Burrow/bunn-burrow/internal/vmimage"
 )
 
 // MaxStdinSize is the maximum size of stdin data that can be sent with an

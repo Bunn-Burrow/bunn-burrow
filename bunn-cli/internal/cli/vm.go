@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -14,9 +13,9 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	"github.com/Bunn-Burrow/bunn-cli/internal/cli/helpers"
 	"github.com/Bunn-Burrow/bunn-cli/internal/config"
-	"github.com/Bunn-Burrow/bunn-cli/internal/output"
-	"github.com/omkar/sandbox/vmm"
+	"github.com/Bunn-Burrow/bunn-burrow/vmm"
 )
 
 // vmTracker tracks VMs created within this CLI process.
@@ -83,49 +82,6 @@ by a new one.`,
 	cmd.AddCommand(newVMListCommand())
 
 	return cmd
-}
-
-// buildVMMConfigFromViper builds a vmm.Config from Viper (which already merges
-// CLI flags > environment variables > config file > defaults).
-func buildVMMConfigFromViper(v *config.Loader, vmID string) (vmm.Config, error) {
-	vmmCfg := vmm.DefaultConfig()
-	vmmCfg.ID = vmID
-	vmmCfg.KernelImage = v.Viper().GetString(config.KeyRuntimeKernelPath)
-	vmmCfg.RootFS = v.Viper().GetString(config.KeyRuntimeRootFSPath)
-	vmmCfg.WorkDir = v.Viper().GetString(config.KeyRuntimeWorkDir)
-	vmmCfg.BinPath = v.Viper().GetString(config.KeyRuntimeFirecrackerBin)
-	vmmCfg.StartTimeout = v.Viper().GetDuration(config.KeyRuntimeStartTimeout)
-	vmmCfg.StopTimeout = v.Viper().GetDuration(config.KeyRuntimeStopTimeout)
-	vmmCfg.StopGraceTimeout = 5 * time.Second
-
-	// Network configuration.
-	if v.Viper().GetBool(config.KeyNetworkEnabled) {
-		gwStr := v.Viper().GetString(config.KeyNetworkGateway)
-		var gw net.IP
-		if gwStr != "" {
-			gw = net.ParseIP(gwStr)
-		}
-		dns := make([]net.IP, 0)
-		for _, value := range v.Viper().GetStringSlice(config.KeyNetworkDNS) {
-			server := net.ParseIP(value).To4()
-			if server == nil {
-				return vmm.Config{}, fmt.Errorf("invalid IPv4 DNS server %q", value)
-			}
-			dns = append(dns, append(net.IP(nil), server...))
-		}
-		vmmCfg.Network = &vmm.NetworkConfig{
-			Enabled:      true,
-			Bridge:       v.Viper().GetString(config.KeyNetworkBridge),
-			CIDR:         v.Viper().GetString(config.KeyNetworkCIDR),
-			Gateway:      gw,
-			DNS:          dns,
-			NATInterface: v.Viper().GetString(config.KeyNetworkNATInterface),
-			Firewall:     v.Viper().GetBool(config.KeyNetworkFirewall),
-			MTU:          v.Viper().GetInt(config.KeyNetworkMTU),
-		}
-	}
-
-	return vmmCfg, nil
 }
 
 // stopVM stops a VM and returns any error. It checks the VM state first so
@@ -199,31 +155,13 @@ is lost. It cannot be managed by a later ` + "`bunn`" + ` invocation.`,
 		Example: `  bunn vm run my-vm --kernel /path/to/vmlinux --rootfs /path/to/rootfs.ext4
   bunn vm run --template my-template`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
+			w := helpers.NewCommandWriter(cmd)
 
 			if len(args) > 0 {
 				vmID = args[0]
 			}
 
-			// Bind flags to Viper so CLI flags take precedence over
-			// environment variables, config file values, and defaults.
-			loader.BindPFlag(config.KeyRuntimeKernelPath, cmd.Flags().Lookup("kernel"))
-			loader.BindPFlag(config.KeyRuntimeRootFSPath, cmd.Flags().Lookup("rootfs"))
-			loader.BindPFlag(config.KeyRuntimeWorkDir, cmd.Flags().Lookup("workdir"))
-			loader.BindPFlag(config.KeyRuntimeFirecrackerBin, cmd.Flags().Lookup("bin"))
-			loader.BindPFlag(config.KeyNetworkEnabled, cmd.Flags().Lookup("network"))
-			loader.BindPFlag(config.KeyNetworkBridge, cmd.Flags().Lookup("network-bridge"))
-			loader.BindPFlag(config.KeyNetworkCIDR, cmd.Flags().Lookup("network-cidr"))
-			loader.BindPFlag(config.KeyNetworkGateway, cmd.Flags().Lookup("network-gateway"))
-			loader.BindPFlag(config.KeyNetworkNATInterface, cmd.Flags().Lookup("network-nat-iface"))
-			loader.BindPFlag(config.KeyNetworkFirewall, cmd.Flags().Lookup("network-firewall"))
-			loader.BindPFlag(config.KeyNetworkMTU, cmd.Flags().Lookup("network-mtu"))
-
-			if _, err := loader.Load(""); err != nil {
-				return err
-			}
-
-			vmmCfg, err := buildVMMConfigFromViper(loader, vmID)
+			vmmCfg, err := helpers.LoadVMMConfig(loader, cmd.Flags(), "workdir", vmID)
 			if err != nil {
 				return err
 			}
@@ -353,7 +291,7 @@ SIGKILL on timeout.`,
 		Example: `  bunn vm stop my-vm`,
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
+			w := helpers.NewCommandWriter(cmd)
 
 			vmID := args[0]
 			vm, ok := globalTracker.get(vmID)
@@ -401,7 +339,7 @@ Releases NBD mappings, writable layers, and template references.`,
 		Example: `  bunn vm delete my-vm`,
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
+			w := helpers.NewCommandWriter(cmd)
 
 			vmID := args[0]
 			vm, ok := globalTracker.get(vmID)
@@ -453,7 +391,7 @@ Because there is no persistent daemon, only VMs started in this session are
 shown. VMs created by a previous ` + "`bunn`" + ` invocation are not listed.`,
 		Example: `  bunn vm list`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
+			w := helpers.NewCommandWriter(cmd)
 
 			vms := globalTracker.list()
 

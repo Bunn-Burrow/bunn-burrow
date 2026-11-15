@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omkar/sandbox/internal/template"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/template"
 	"github.com/stretchr/testify/require"
 )
 

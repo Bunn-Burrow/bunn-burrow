@@ -10,11 +10,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/omkar/sandbox/internal/envcache"
-	"github.com/omkar/sandbox/internal/image"
-	"github.com/omkar/sandbox/internal/image/cache"
-	"github.com/omkar/sandbox/internal/rootfs"
-	"github.com/omkar/sandbox/internal/storage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/envcache"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/image"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/image/cache"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/rootfs"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/storage"
 )
 
 // Preparer orchestrates OCI image environment preparation: pulling, caching,

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/omkar/sandbox/internal/storage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/storage"
 	"github.com/stretchr/testify/require"
 )
 

@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"sandbox/guest-agent/internal/guestagent"
+	"github.com/Bunn-Burrow/bunn-burrow/guest-agent/internal/guestagent"
 )
 
 func main() {

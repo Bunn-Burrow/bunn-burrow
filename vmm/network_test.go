@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/omkar/sandbox/internal/network"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/network"
 	"github.com/stretchr/testify/require"
 )
 

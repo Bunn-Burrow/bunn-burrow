@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/omkar/sandbox/vmm"
+	"github.com/Bunn-Burrow/bunn-burrow/vmm"
 	"github.com/stretchr/testify/require"
 )
 

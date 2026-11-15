@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/omkar/sandbox/internal/template"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/template"
 )
 
 // SnapshotRef is a storage-side summary of a snapshot, used by the

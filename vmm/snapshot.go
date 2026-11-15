@@ -15,8 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/omkar/sandbox/internal/storage"
-	"github.com/omkar/sandbox/internal/template"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/storage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/template"
 )
 
 // SnapshotInfo records the metadata and artifact locations for a snapshot.

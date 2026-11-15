@@ -1,4 +1,4 @@
-module github.com/omkar/sandbox
+module github.com/Bunn-Burrow/bunn-burrow
 
 go 1.27
 

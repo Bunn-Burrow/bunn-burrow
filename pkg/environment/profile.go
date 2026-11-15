@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/omkar/sandbox/vmm"
+	"github.com/Bunn-Burrow/bunn-burrow/vmm"
 )
 
 const fullstackProfileVersion = "ubuntu-fullstack-v1"

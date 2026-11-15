@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,9 +17,10 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"github.com/Bunn-Burrow/bunn-cli/internal/cli/helpers"
 	"github.com/Bunn-Burrow/bunn-cli/internal/config"
-	"github.com/omkar/sandbox/pkg/environment"
-	"github.com/omkar/sandbox/vmm"
+	"github.com/Bunn-Burrow/bunn-burrow/pkg/environment"
+	"github.com/Bunn-Burrow/bunn-burrow/vmm"
 )
 
 func newTerminalCommand(loader *config.Loader) *cobra.Command {
@@ -83,24 +83,8 @@ when the guest shell exits or when the local terminal session is interrupted.`,
 				vmID = args[0]
 			}
 
-			loader.BindPFlag(config.KeyRuntimeKernelPath, cmd.Flags().Lookup("kernel"))
-			loader.BindPFlag(config.KeyRuntimeRootFSPath, cmd.Flags().Lookup("rootfs"))
-			loader.BindPFlag(config.KeyRuntimeWorkDir, cmd.Flags().Lookup("vm-workdir"))
-			loader.BindPFlag(config.KeyRuntimeFirecrackerBin, cmd.Flags().Lookup("bin"))
-			loader.BindPFlag(config.KeyNetworkEnabled, cmd.Flags().Lookup("network"))
-			loader.BindPFlag(config.KeyNetworkBridge, cmd.Flags().Lookup("network-bridge"))
-			loader.BindPFlag(config.KeyNetworkCIDR, cmd.Flags().Lookup("network-cidr"))
-			loader.BindPFlag(config.KeyNetworkGateway, cmd.Flags().Lookup("network-gateway"))
 			loader.BindPFlag(config.KeyNetworkDNS, cmd.Flags().Lookup("network-dns"))
-			loader.BindPFlag(config.KeyNetworkNATInterface, cmd.Flags().Lookup("network-nat-iface"))
-			loader.BindPFlag(config.KeyNetworkFirewall, cmd.Flags().Lookup("network-firewall"))
-			loader.BindPFlag(config.KeyNetworkMTU, cmd.Flags().Lookup("network-mtu"))
-
-			if _, err := loader.Load(""); err != nil {
-				return err
-			}
-
-			cfg, err := buildVMMConfigFromViper(loader, vmID)
+			cfg, err := helpers.LoadVMMConfig(loader, cmd.Flags(), "vm-workdir", vmID)
 			if err != nil {
 				return err
 			}
@@ -139,7 +123,7 @@ when the guest shell exits or when the local terminal session is interrupted.`,
 				networkEnabled = true
 			}
 			if networkEnabled {
-				cfg.Network, err = terminalNetworkConfig(loader)
+				cfg.Network, err = helpers.ResolveNetworkConfig(loader)
 				if err != nil {
 					return err
 				}
@@ -458,10 +442,6 @@ func splitCommandLine(s string) []string {
 	return parts
 }
 
-func netFromString(s string) net.IP {
-	return net.ParseIP(s)
-}
-
 func terminalEnvironment(secretNames []string) ([]string, error) {
 	terminal := os.Getenv("TERM")
 	if terminal == "" {
@@ -509,40 +489,11 @@ func validEnvironmentName(name string) bool {
 	return true
 }
 
-func terminalNetworkConfig(loader *config.Loader) (*vmm.NetworkConfig, error) {
-	gatewayString := loader.Viper().GetString(config.KeyNetworkGateway)
-	var gateway net.IP
-	if gatewayString != "" {
-		gateway = netFromString(gatewayString)
-		if gateway == nil {
-			return nil, fmt.Errorf("invalid gateway %q", gatewayString)
-		}
-	}
-	dns := make([]net.IP, 0)
-	for _, value := range loader.Viper().GetStringSlice(config.KeyNetworkDNS) {
-		server := net.ParseIP(value).To4()
-		if server == nil {
-			return nil, fmt.Errorf("invalid IPv4 DNS server %q", value)
-		}
-		dns = append(dns, append(net.IP(nil), server...))
-	}
-	return &vmm.NetworkConfig{
-		Enabled:      true,
-		Bridge:       loader.Viper().GetString(config.KeyNetworkBridge),
-		CIDR:         loader.Viper().GetString(config.KeyNetworkCIDR),
-		Gateway:      gateway,
-		DNS:          dns,
-		Firewall:     loader.Viper().GetBool(config.KeyNetworkFirewall),
-		MTU:          loader.Viper().GetInt(config.KeyNetworkMTU),
-		NATInterface: loader.Viper().GetString(config.KeyNetworkNATInterface),
-	}, nil
-}
-
 func terminalNetworkSettingConfigured(loader *config.Loader) bool {
 	if loader.Viper().InConfig(config.KeyNetworkEnabled) {
 		return true
 	}
-	_, exists := os.LookupEnv("BUNN_BURROW_NETWORK_ENABLED")
+	_, exists := os.LookupEnv(config.EnvPrefix + "_NETWORK_ENABLED")
 	return exists
 }
 

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/omkar/sandbox/internal/network"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/network"
 )
 
 func main() {

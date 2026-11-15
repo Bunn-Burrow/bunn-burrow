@@ -121,40 +121,6 @@ func TestKeyValueOutput(t *testing.T) {
 	require.Contains(t, output, "running")
 }
 
-// TestFormatDoctorStatus verifies doctor status formatting.
-func TestFormatDoctorStatus(t *testing.T) {
-	var buf bytes.Buffer
-	w := &Writer{
-		out:    &buf,
-		err:    &buf,
-		format: FormatTable,
-		color:  false,
-		style:  NewStyles(false),
-	}
-
-	require.Equal(t, "PASS", FormatDoctorStatus(w, "pass"))
-	require.Equal(t, "WARN", FormatDoctorStatus(w, "warn"))
-	require.Equal(t, "FAIL", FormatDoctorStatus(w, "fail"))
-	require.Equal(t, "SKIP", FormatDoctorStatus(w, "skip"))
-	require.Equal(t, "unknown", FormatDoctorStatus(w, "unknown"))
-}
-
-// TestFormatDoctorStatusNoColor verifies no ANSI in no-color mode.
-func TestFormatDoctorStatusNoColor(t *testing.T) {
-	var buf bytes.Buffer
-	w := &Writer{
-		out:    &buf,
-		err:    &buf,
-		format: FormatTable,
-		color:  false,
-		style:  NewStyles(false),
-	}
-
-	result := FormatDoctorStatus(w, "pass")
-	require.NotContains(t, result, "\x1b")
-	require.Equal(t, "PASS", result)
-}
-
 // TestWriterColorAutoNoTTY verifies color is disabled in non-TTY.
 func TestWriterColorAutoNoTTY(t *testing.T) {
 	w := NewWriter(FormatTable, "auto")

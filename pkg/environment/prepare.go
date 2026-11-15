@@ -9,8 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/omkar/sandbox/internal/image"
-	internalprepare "github.com/omkar/sandbox/internal/prepare"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/image"
+	internalprepare "github.com/Bunn-Burrow/bunn-burrow/internal/prepare"
 )
 
 // Config contains the storage and Guest Agent settings for OCI preparation.

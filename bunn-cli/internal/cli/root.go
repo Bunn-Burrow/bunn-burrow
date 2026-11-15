@@ -7,7 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/Bunn-Burrow/bunn-cli/internal/buildinfo"
 	"github.com/Bunn-Burrow/bunn-cli/internal/config"
 	"github.com/Bunn-Burrow/bunn-cli/internal/output"
 )
@@ -31,7 +30,6 @@ It operates the local runtime directly - it is not a Control Plane client.
 Use it to manage VMs, templates, snapshots, and inspect runtime health.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Version:       buildinfo.Version,
 	}
 
 	rootCmd.PersistentFlags().StringVar(&format, "output", "table", "Output format: table, json, text")
@@ -42,12 +40,9 @@ Use it to manage VMs, templates, snapshots, and inspect runtime health.`,
 	loader.BindPFlag(config.KeyOutputFormat, rootCmd.PersistentFlags().Lookup("output"))
 	loader.BindPFlag(config.KeyOutputColor, rootCmd.PersistentFlags().Lookup("color"))
 
-	rootCmd.AddCommand(newVersionCommand())
-	rootCmd.AddCommand(newDoctorCommand())
 	rootCmd.AddCommand(newConfigCommand(loader))
 	rootCmd.AddCommand(newVMCommand(loader))
 	rootCmd.AddCommand(newRuntimeCommand(loader))
-	rootCmd.AddCommand(newAgentCommand(loader))
 	rootCmd.AddCommand(newTerminalCommand(loader))
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {

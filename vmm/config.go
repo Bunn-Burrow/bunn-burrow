@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/omkar/sandbox/internal/network"
-	"github.com/omkar/sandbox/internal/storage"
-	"github.com/omkar/sandbox/internal/template"
-	vmimage "github.com/omkar/sandbox/internal/vmimage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/network"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/storage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/template"
+	vmimage "github.com/Bunn-Burrow/bunn-burrow/internal/vmimage"
 )
 
 // GuestAgentVsockPort is the port the bundled Guest Agent listens on.

@@ -16,10 +16,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
-	"github.com/omkar/sandbox/internal/network"
-	"github.com/omkar/sandbox/internal/storage"
-	"github.com/omkar/sandbox/internal/template"
-	vmimage "github.com/omkar/sandbox/internal/vmimage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/network"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/storage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/template"
+	vmimage "github.com/Bunn-Burrow/bunn-burrow/internal/vmimage"
 )
 
 // VM owns a Firecracker microVM instance: its lifecycle state, process handle,

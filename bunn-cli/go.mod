@@ -3,8 +3,8 @@ module github.com/Bunn-Burrow/bunn-cli
 go 1.27
 
 require (
+	github.com/Bunn-Burrow/bunn-burrow v0.0.0
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/omkar/sandbox v0.0.0
 	github.com/sirupsen/logrus v1.10.2
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
@@ -80,4 +80,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/omkar/sandbox => ..
+replace github.com/Bunn-Burrow/bunn-burrow => ..

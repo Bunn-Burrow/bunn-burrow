@@ -16,10 +16,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/omkar/sandbox/internal/envcache"
-	"github.com/omkar/sandbox/internal/image"
-	"github.com/omkar/sandbox/internal/prepare"
-	"github.com/omkar/sandbox/vmm"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/envcache"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/image"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/prepare"
+	"github.com/Bunn-Burrow/bunn-burrow/vmm"
 )
 
 func main() {

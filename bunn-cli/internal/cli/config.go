@@ -1,12 +1,12 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"github.com/Bunn-Burrow/bunn-cli/internal/config"
-	"github.com/Bunn-Burrow/bunn-cli/internal/output"
 )
 
 // newConfigCommand creates the `config` subcommand group.
@@ -43,8 +43,6 @@ or at a custom path. Refuses to overwrite an existing file unless --force is set
 		Example: `  bunn config init
   bunn config init --path ~/my-config.yaml --force`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
-
 			cfg := config.Defaults()
 			p := config.ConfigPath(path)
 
@@ -57,10 +55,10 @@ or at a custom path. Refuses to overwrite an existing file unless --force is set
 					Path   string `json:"path"`
 					Status string `json:"status"`
 				}
-				return w.JSON(initResult{Path: p, Status: "created"})
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(initResult{Path: p, Status: "created"})
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", w.Styles().Success.Render(fmt.Sprintf("Configuration written to %s", p)))
+			fmt.Fprintf(cmd.OutOrStdout(), "Configuration written to %s\n", p)
 			return nil
 		},
 	}
@@ -90,8 +88,6 @@ With --redact, sensitive fields are masked (presence indicated, value hidden).`,
   bunn config view --path ~/my-config.yaml
   bunn config view --redact`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			w := output.NewWriter(output.FormatTable, "never")
-
 			cfg, err := loader.Load(path)
 			if err != nil {
 				return err
@@ -101,7 +97,7 @@ With --redact, sensitive fields are masked (presence indicated, value hidden).`,
 				if redact {
 					cfg = config.Redacted(cfg)
 				}
-				return w.JSON(cfg)
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(cfg)
 			}
 
 			if redact {

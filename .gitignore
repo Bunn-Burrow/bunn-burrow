@@ -18,3 +18,7 @@ coverage.out
 .idea/
 .DS_Store
 /cache/
+# Generated binaries, VM images and local verification artifacts
+/bin/
+/bunn-cli/bunn
+/cmd/prepare/sandbox

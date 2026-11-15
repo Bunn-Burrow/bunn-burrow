@@ -10,8 +10,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/omkar/sandbox/internal/image"
-	"github.com/omkar/sandbox/internal/prepare"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/image"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/prepare"
 )
 
 func main() {

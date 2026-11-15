@@ -1,206 +1,104 @@
 # Bunn Burrow
 
-[![CI](https://github.com/omkar/sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/omkar/sandbox/actions/workflows/ci.yml)
+[![CI](https://github.com/Bunn-Burrow/bunn-burrow/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunn-Burrow/bunn-burrow/actions/workflows/ci.yml)
 
-Isolated execution platform for developers and AI agents using Firecracker microVMs and OCI container images.
+Bunn Burrow is a Linux development project for running commands in Firecracker
+microVMs. It includes a host runtime, a guest-side agent, OCI-based root
+filesystem preparation, and a local developer CLI. It is not a hosted service
+or a persistent control plane.
 
-## Architecture Overview
+## What is included
 
-Bunn Burrow runs arbitrary workloads inside isolated Firecracker microVMs. The platform consists of:
+- A Go host runtime for Firecracker VM lifecycle and guest command execution.
+- A Guest Agent that runs in the VM and communicates with the host over
+  vsock.
+- OCI image preparation and local environment caching.
+- The `bunn` CLI for local VM and terminal workflows, configuration, and
+  runtime inspection.
+- Library APIs for storage, templates, snapshots, and networking; availability
+  of an API does not mean every workflow is exposed by the CLI or end-to-end
+  verified.
 
-- **Host application** (`bunn-burrow`): Controls VM lifecycle, OCI image management, and workload submission
-- **Guest Agent** (`guest-agent`): Runs as PID 1 inside each VM, handles vsock communication and process execution
-- **Vsock communication**: Host-to-guest channel using length-prefixed JSON frames
-- **OCI image pipeline**: Image resolution, layer caching, rootfs extraction, ext4 image building, environment caching
+## Requirements
 
-## Repository Structure
+- Linux with working KVM access.
+- Go 1.27 or newer.
+- Firecracker and a compatible Linux kernel image for VM workflows.
+- `e2fsprogs` (`mkfs.ext4`, `debugfs`) and registry access for OCI image
+  preparation.
+- `qemu-img`, `qemu-nbd`, and host networking tools only for the corresponding
+  storage or networking paths.
 
-```
-bunn-burrow/
-├── cmd/
-│   ├── prepare/          # Temporary M2 integration harness
-│   ├── prep_py/          # Temporary Python environment prep
-│   ├── prep_node/        # Temporary Node.js environment prep
-│   └── test/             # Temporary M3 integration test harness
-├── bunn-cli/                 # Independent CLI module (binary: `bunn`)
-│   ├── cmd/bunn/             # CLI entrypoint
-│   ├── internal/             # CLI packages (cli, config, output, doctor, buildinfo)
-│   ├── Makefile              # Build targets
-│   └── README.md             # CLI-specific documentation
-├── docs/                 # Human-facing documentation
-├── guest-agent/
-│   ├── bin/              # Built guest agent binaries
-│   ├── cmd/guest-agent/  # Guest Agent PID 1 entry point
-│   └── internal/guestagent/  # Agent, vsock server, process manager
-├── internal/
-│   ├── envcache/         # Prepared environment cache
-│   ├── image/            # OCI image resolution and layer caching
-│   ├── image/cache/      # Content-addressed layer cache
-│   ├── prepare/          # Environment preparation orchestrator
-│   ├── rootfs/           # OCI layer extraction and rootfs building
-│   ├── storage/          # Per-VM writable layer management
-│   └── template/         # Immutable VM template metadata and registration
-├── vmm/                  # Firecracker VM lifecycle management
-├── main.go               # Host application entry point
-├── go.mod
-└── go.sum
-```
+## Build and validate
 
-## Prerequisites
-
-- Go 1.27+
-- Firecracker binary (v1.0.1 or later)
-- Linux kernel with KVM support
-- `mkfs.ext4`, `debugfs` (e2fsprogs)
-- `qemu-img` (qemu-utils) for M5 copy-on-write backing images and overlays
-- `qemu-nbd` for M5 NBD device mapping and M6 snapshots
-- `~/.local/bin/firecracker` or `firecracker` in PATH
-- `~/.local/firecracker/vmlinux` kernel image
-
-## Quick Start
-
-### 1. Build the host application
+From the repository root:
 
 ```bash
-cd ~/bunn-burrow
-mkdir -p bin
-GOWORK=off go build -o bin/bunn-burrow .
+make build
+make test
+make vet
 ```
 
-### 2. Build the Guest Agent
+`make build` writes binaries to `bin/` and replaces any files there with the
+same output names. To compile packages without writing executable files into
+the repository:
 
 ```bash
-cd ~/bunn-burrow
-(cd guest-agent && GOWORK=off CGO_ENABLED=0 go build -o ../bin/guest-agent-static ./cmd/guest-agent)
+GOWORK=off go build ./...
+(cd guest-agent && GOWORK=off CGO_ENABLED=0 go build ./...)
+(cd bunn-cli && GOWORK=off go build ./...)
 ```
 
-### 3. Prepare an OCI environment (first run)
+## Getting started
+
+Build the binaries and prepare a root filesystem with the Guest Agent injected:
 
 ```bash
-# Build the preparation harness and prepare Alpine 3.24
-GOWORK=off go build -o bin/bunn-prepare-harness ./cmd/prepare
+make build
 ./bin/bunn-prepare-harness \
   --cache-dir "$HOME/.cache/bunn-burrow" \
-  --guest-agent bin/guest-agent-static \
+  --guest-agent "$PWD/bin/guest-agent-static" \
   --kernel "$HOME/.local/firecracker/vmlinux" \
-  --workdir bin/work \
+  --bin "$HOME/.local/bin/firecracker" \
+  --workdir "$PWD/bin/prepare-work"
+```
+
+The preparation workflow needs registry access, Firecracker, KVM, a compatible
+kernel, and ext4 tools. Use the prepared `rootfs.ext4` path under the cache for
+a terminal session:
+
+```bash
+./bin/bunn terminal run \
+  --kernel "$HOME/.local/firecracker/vmlinux" \
+  --rootfs "/path/to/prepared/rootfs.ext4" \
   --bin "$HOME/.local/bin/firecracker"
 ```
 
-The prepared environment is cached. Subsequent preparations of the same image are cache hits.
+The root filesystem must contain `/sbin/bunn-agent`. Replace the example paths
+with paths from your host. See the [product and operator guide](docs.md) for
+configuration, commands, limitations, and troubleshooting.
 
-### 4. Build the bunn CLI (optional)
+## Project layout
 
-```bash
-(cd bunn-cli && GOWORK=off go build -o ../bin/bunn ./cmd/bunn)
-```
+| Path | Purpose |
+| --- | --- |
+| `vmm/`, `internal/`, `pkg/`, `cmd/` | Host runtime, preparation, shared APIs, and development tools |
+| `guest-agent/` | Separate Go module for the guest agent |
+| `bunn-cli/` | Separate Go module for the `bunn` CLI |
+| `docs.md` | Canonical product, setup, and operator guide |
+| `docs/` | Preserved architecture notes, research, and earlier operator documentation |
 
-The binary is named `bunn` and provides developer-facing commands for VM lifecycle,
-configuration, and runtime diagnostics. See [bunn-cli/README.md](bunn-cli/README.md)
-for full CLI documentation.
+## Current limitations
 
-### 5. Execute a workload
-
-```bash
-cd ~/bunn-burrow
-FIRECRACKER_KERNEL="$HOME/.local/firecracker/vmlinux" \
-FIRECRACKER_ROOTFS="/path/to/prepared-rootfs.ext4" \
-FIRECRACKER_WORKDIR="$PWD/bin/work" \
-FIRECRACKER_BIN="$HOME/.local/bin/firecracker" \
-  ./bin/bunn-burrow exec test-vm /bin/busybox echo "Hello from Firecracker"
-```
-
-`/path/to/prepared-rootfs.ext4` must be replaced with the actual rootfs path
-reported by the preparation harness.
-
-## Detailed Documentation
-
-- [docs/setup.md](docs/setup.md) - Setup and dependencies
-- [docs/build.md](docs/build.md) - Building host and Guest Agent
-- [docs/run.md](docs/run.md) - Running the platform
-- [docs/architecture.md](docs/architecture.md) - Architecture details
-- [docs/runtime-guide.md](docs/runtime-guide.md) - Running workloads by runtime
-- [docs/troubleshooting.md](docs/troubleshooting.md) - Common issues and fixes
-- [docs/COMMANDS.md](docs/COMMANDS.md) - Verified command manual, feature status, and limitations
-- [bunn-cli/README.md](bunn-cli/README.md) - CLI build, configuration, and command reference
-
-## bunn CLI Reference
-
-The `bunn` CLI (in `bunn-cli/`) is an independent Go module providing developer-facing
-commands for the local runtime:
-
-| Command | Description |
-|---------|-------------|
-| `bunn version` | Print CLI version |
-| `bunn doctor` | Diagnose runtime health |
-| `bunn config init` | Initialize config file |
-| `bunn config view` | View effective config |
-| `bunn config path` | Print config file path |
-| `bunn runtime list` | List runtime capabilities |
-| `bunn runtime inspect` | Inspect resolved configuration |
-| `bunn vm run` | Start a VM |
-| `bunn vm list` | List VMs in this session |
-| `bunn vm stop` | Stop a VM |
-| `bunn vm delete` | Delete a VM |
-
-All commands support `--output table\|json\|text` and `--color auto\|always\|never`.
+VM and CLI lifecycle state is process-local; there is no persistent daemon or
+cross-invocation reconnection. Guest networking, persistent guest volumes,
+template-backed VM workflows, and snapshot restore are not established as
+end-to-end supported workflows. Treat this project as a development runtime,
+not as a production multi-tenant security boundary. Do not forward credentials
+to untrusted guest workloads.
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for
-the full development workflow, coding standards, and pull request process.
-
-### Quick contribution checklist
-
-1. Create a branch from `main` (e.g., `feature/description`)
-2. Implement your changes
-3. Run local validation:
-
-   ```bash
-   gofmt -l .
-   go mod verify
-   go vet ./...
-   go build ./...
-   go test -count=1 ./...
-   go test -race ./...
-   cd guest-agent && GOWORK=off CGO_ENABLED=0 go build ./...
-   git diff --check
-   ```
-
-4. Commit using Conventional Commits (e.g., `feat:`, `fix:`, `docs:`)
-5. Push and open a pull request against `main`
-
-## Current Limitations
-
-- Guest Agent must be injected into the OCI rootfs during preparation
-- Guest networking is not end-to-end verified; vsock is the verified host-to-guest channel
-- Each workload execution boots a new Firecracker VM
-- CLI VM and agent state is in-memory and cannot be managed by a later CLI invocation
-- Volume guest formatting/mounting, template-backed runtime, and snapshot restore are not fully verified
-
-## Milestone 4, 5, 6, 7 & 8: Templates, COW Storage, Snapshot/Restore, Lifecycle Management & Runtime Reliability
-
-**Implementation status: APIs are present; end-to-end verification is incomplete.**
-
-M4 adds reusable, immutable VM templates. M5 replaces the full per-VM rootfs
-copy with a copy-on-write storage engine using qcow2 backing images and
-per-VM writable overlays. M6 adds Firecracker VM snapshot and restore. M7 adds
-persistent storage lifecycle management and crash recovery. M8 adds runtime
-reliability, crash-consistent snapshots with guest coordination protocol, and
-enhanced crash recovery.
-
-- **Template management**: `internal/template` — register a prepared rootfs as an immutable template (ID, name, base image, rootfs path/format, architecture, checksum, version), with retrieval, listing, SHA256 integrity validation, and safe deletion (blocked while in use).
-- **Immutable rootfs**: template rootfs and backing image are never opened for write after creation, are chmod read-only, and the rootfs checksum is verified on every VM start.
-- **Copy-on-write storage** (M5): `internal/storage` — one immutable qcow2 backing image per template; one VM-private writable qcow2 overlay per VM; `qemu-img` required. Overlays exposed to Firecracker via NBD (`qemu-nbd`) since Firecracker does not understand qcow2 natively.
-- **Per-VM writable filesystem**: each VM created from a template (`Config.TemplateID`) boots from an independent qcow2 overlay via a unique NBD device, cleaned up on VM destroy. Concurrent creation from one template is safe.
-- **Snapshot & restore** (M6): `vmm/snapshot.go` — crash-consistent snapshots from paused VMs via Firecracker `CreateSnapshot`/`LoadSnapshot`; self-contained overlay copies for snapshot independence; durable `SnapshotStore` with atomic metadata; `RestoreSnapshot` creates independent VMs with unique host-side resources.
-- **Storage lifecycle & crash recovery** (M7): `internal/storage/manager.go`, `internal/storage/metadata.go`, `internal/storage/nbd.go` — persistent storage metadata with reference counting, `Recover` for post-crash reconciliation, `CollectGarbage` (dry-run/exec) for orphan cleanup, `ReconcileNBD` for stale NBD mapping detection, `DeleteSnapshot` for safe snapshot removal.
-- **Runtime reliability** (M8): `vmm/snapshot_coordinator.go` — `SnapshotCoordinator` with `crash_consistent` mode; Guest Agent snapshot coordination protocol (v2) with `prepare_snapshot`, `sync_filesystems`, `freeze_filesystems`, `thaw_filesystems`, `snapshot_ready` handlers; context-aware NBD `Map`/`UnmapContext`; process identity verification; improved `Stop()` escalation; structured lifecycle logging; enhanced `Recover()` with interrupted operation detection.
-  - **Consistency guarantees**: `crash_consistent` (VM paused at snapshot time; disk writes captured as they exist in host page cache). `filesystem_consistent` is deferred — `sync()` alone does not provide filesystem freezing, and guest-side FIFREEZE support cannot be safely guaranteed across all guest images.
-- **Backward compatible**: direct rootfs creation (`Config.RootFS` without `TemplateID`) is preserved. Legacy `Fork`/`restoreVM` API preserved.
-
-See `docs/architecture.md` (M5/M6/M7/M8 sections) and `docs/run.md` (M5/M6/M7/M8 usage) for details.
-These milestone descriptions summarize code paths, not verified user workflows.
-For tested commands and explicit limitations, see [docs/COMMANDS.md](docs/COMMANDS.md).
-
-**Deferred to M9:** automatic VM resumption after crash, `filesystem_consistent` snapshots with safe guest freeze/thaw, application-consistent snapshots, a persistent CLI/SDK, runtime metrics collection.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development and validation
+workflow. No license has been selected in this repository; do not assume
+redistribution terms.

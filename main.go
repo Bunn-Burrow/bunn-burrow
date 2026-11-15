@@ -17,7 +17,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/omkar/sandbox/vmm"
+	"github.com/Bunn-Burrow/bunn-burrow/vmm"
 )
 
 func main() {

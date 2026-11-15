@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/omkar/sandbox/internal/storage"
+	"github.com/Bunn-Burrow/bunn-burrow/internal/storage"
 )
 
 // ImageConfig holds configuration for the ImageManager.
