@@ -35,6 +35,11 @@ jobs:
             guest-agent/go.sum
             bunn-cli/go.sum
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils
+
       # ---- Root module checks ----
       - name: Verify Go formatting (root module)
         run: |
