@@ -847,17 +847,16 @@ func restoreVM(ctx context.Context, child *VM, snap *SnapshotInfo) error {
 
 	cleanup := newSnapshotCleanup(child)
 
+	// Verify snapshot integrity BEFORE starting Firecracker. If artifacts are
+	// corrupt, reject immediately without launching a process.
+	if err := verifyArtifactChecksums(snap); err != nil {
+		return fmt.Errorf("snapshot integrity check failed: %w", err)
+	}
+
 	if err := child.startProcessAndWait(ctx); err != nil {
 		return fmt.Errorf("start restore Firecracker: %w", err)
 	}
 	cleanup.trackRestore(true, false, false, false)
-
-	if err := verifyArtifactChecksums(snap); err != nil {
-		if cerr := cleanup.Cleanup(); cerr != nil {
-			child.logger.WithError(cerr).Warn("restore cleanup failed")
-		}
-		return fmt.Errorf("snapshot integrity check failed: %w", err)
-	}
 
 	if err := child.api.LoadSnapshotWithOverride(ctx, snap.SnapshotPath, snap.MemFilePath, true, child.res.VsockSock); err != nil {
 		if cerr := cleanup.Cleanup(); cerr != nil {
