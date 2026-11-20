@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mdlayher/vsock"
+	"golang.org/x/sys/unix"
 )
 
 // OCIConfig holds the OCI image configuration defaults.
@@ -876,9 +877,10 @@ func validateExecuteRequest(req map[string]any) error {
 // in-flight request. State is scoped per request_id to avoid cross-VM
 // interference when multiple snapshots coordinate concurrently.
 type snapshotRequestState struct {
-	mu       sync.Mutex
-	frozen   bool
-	prepared bool
+	mu           sync.Mutex
+	frozen       bool
+	prepared     bool
+	frozenMounts []string // mount points successfully frozen via FIFREEZE
 }
 
 // snapshotStates maps request_id to per-request snapshot coordination state.
@@ -907,6 +909,221 @@ func deleteSnapshotState(reqID string) {
 	snapshotStatesMu.Lock()
 	defer snapshotStatesMu.Unlock()
 	delete(snapshotStates, reqID)
+}
+
+// FIFREEZE and FITHAW ioctl request numbers for Linux filesystems.
+// Defined in include/uapi/linux/fs.h:
+//
+//	#define FIFREEZE _IOW(0x72, 2, int)
+//	#define FITHAW   _IOW(0x72, 3, int)
+const (
+	FIFREEZE = 0x80047202
+	FITHAW   = 0x80047203
+)
+
+// freezableMountTypes is the set of filesystem types that support FIFREEZE.
+// Pseudo-filesystems, read-only mounts, and special filesystems are excluded
+// because FIFREEZE returns EINVAL or is meaningless for them.
+var freezableMountTypes = map[string]struct{}{
+	"ext4":     {},
+	"ext3":     {},
+	"ext2":     {},
+	"xfs":      {},
+	"btrfs":    {},
+	"vfat":     {},
+	"ntfs":     {},
+	"ntfs3":    {},
+	"exfat":    {},
+	"jfs":      {},
+	"reiserfs": {},
+	"ocfs2":    {},
+}
+
+// nonFreezablePrefixes matches mount types that should never be frozen.
+// These are pseudo/special filesystems where FIFREEZE is not supported.
+var nonFreezablePrefixes = []string{
+	"proc", "sysfs", "devtmpfs", "tmpfs", "ramfs", "rootfs",
+	"cgroup", "cgroup2", "pstore", "autofs", "rpc_pipefs",
+	"devpts", "mqueue", "hugetlbfs", "fusectl", "configfs",
+	"debugfs", "tracefs", "securityfs", "bpf", "fuse",
+	"overlay", "squashfs", "iso9660", "udf",
+}
+
+// mountInfo represents a parsed /proc/mounts entry.
+type mountInfo struct {
+	device  string
+	path    string
+	fstype  string
+	options string
+}
+
+// parseProcMounts reads /proc/mounts and returns a list of mount entries.
+func parseProcMounts() ([]mountInfo, error) {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return nil, fmt.Errorf("read /proc/mounts: %w", err)
+	}
+
+	var mounts []mountInfo
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		mounts = append(mounts, mountInfo{
+			device:  fields[0],
+			path:    fields[1],
+			fstype:  fields[2],
+			options: fields[3],
+		})
+	}
+	return mounts, nil
+}
+
+// isFreezable returns true if the mount should be frozen.
+// It excludes pseudo-filesystems, read-only mounts, and special filesystems.
+func isFreezable(m mountInfo) bool {
+	// Skip read-only mounts.
+	for _, opt := range strings.Split(m.options, ",") {
+		if opt == "ro" {
+			return false
+		}
+	}
+
+	// Skip pseudo/special filesystems by prefix match.
+	for _, prefix := range nonFreezablePrefixes {
+		if strings.HasPrefix(m.fstype, prefix) {
+			return false
+		}
+	}
+
+	// Only allow known freezable filesystem types.
+	if _, ok := freezableMountTypes[m.fstype]; !ok {
+		return false
+	}
+
+	return true
+}
+
+// freezeMountPath sends FIFREEZE to a single mount point path.
+func freezeMountPath(path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("open %q: %w", path, err)
+	}
+	defer unix.Close(fd)
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), FIFREEZE, 0)
+	if errno != 0 {
+		return fmt.Errorf("FIFREEZE %q: %w", path, errno)
+	}
+	return nil
+}
+
+// thawMountPath sends FITHAW to a single mount point path.
+func thawMountPath(path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("open %q: %w", path, err)
+	}
+	defer unix.Close(fd)
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), FITHAW, 0)
+	if errno != 0 {
+		return fmt.Errorf("FITHAW %q: %w", path, errno)
+	}
+	return nil
+}
+
+// freezeMounts freezes all eligible mount points for the given request.
+// It returns the list of mount points successfully frozen. If any freeze
+// fails, all previously frozen mounts are thawed before returning the error.
+func freezeMounts(reqID string) ([]string, error) {
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	if state.frozen {
+		state.mu.Unlock()
+		return nil, errors.New("guest filesystems already frozen")
+	}
+	if !state.prepared {
+		state.mu.Unlock()
+		return nil, errors.New("guest not prepared for snapshot")
+	}
+	state.mu.Unlock()
+
+	// Sync all filesystems before freeze.
+	syscall.Sync()
+
+	mounts, err := parseProcMounts()
+	if err != nil {
+		return nil, err
+	}
+
+	return freezeMountList(reqID, mounts)
+}
+
+// freezeMountList freezes all eligible mount points from the given list.
+// It is exported for testing so callers can inject a custom mount list
+// instead of reading /proc/mounts.
+func freezeMountList(reqID string, mounts []mountInfo) ([]string, error) {
+	var frozen []string
+	for _, m := range mounts {
+		if !isFreezable(m) {
+			continue
+		}
+
+		if err := freezeMountPath(m.path); err != nil {
+			// Thaw all mounts we successfully froze so far.
+			for _, fm := range frozen {
+				if terr := thawMountPath(fm); terr != nil {
+					log.Printf("failed to thaw %q during error cleanup: %v", fm, terr)
+				}
+			}
+			return nil, fmt.Errorf("freeze filesystems: %w", err)
+		}
+		frozen = append(frozen, m.path)
+	}
+
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	state.frozen = true
+	state.frozenMounts = frozen
+	state.mu.Unlock()
+
+	return frozen, nil
+}
+
+// thawMounts thaws all mount points previously frozen for the given request.
+// It is safe to call even if no mounts are frozen.
+func thawMounts(reqID string) error {
+	state := getSnapshotState(reqID)
+	state.mu.Lock()
+	if !state.frozen {
+		state.mu.Unlock()
+		return errors.New("guest filesystems not frozen")
+	}
+	frozen := append([]string{}, state.frozenMounts...)
+	state.frozen = false
+	state.prepared = false
+	state.frozenMounts = nil
+	state.mu.Unlock()
+
+	var firstErr error
+	for _, m := range frozen {
+		if err := thawMountPath(m); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("failed to thaw %q: %v", m, err)
+		}
+	}
+
+	deleteSnapshotState(reqID)
+	return firstErr
 }
 
 // handlePrepareSnapshot prepares the guest for snapshot: sync filesystem state.
@@ -973,30 +1190,18 @@ func (s *Server) handleFreezeFilesystems(conn net.Conn, req map[string]any) {
 		return
 	}
 
-	state := getSnapshotState(reqID)
-	state.mu.Lock()
-	if state.frozen {
-		state.mu.Unlock()
-		s.writeError(conn, 409, "guest filesystems already frozen")
+	frozen, err := freezeMounts(reqID)
+	if err != nil {
+		s.writeError(conn, 500, err.Error())
 		return
 	}
-	if !state.prepared {
-		state.mu.Unlock()
-		s.writeError(conn, 409, "guest not prepared for snapshot")
-		return
-	}
-
-	// Sync all filesystems before freeze.
-	syscall.Sync()
-
-	state.frozen = true
-	state.mu.Unlock()
 
 	resp := map[string]any{
-		"kind":       "filesystems_frozen",
-		"request_id": reqID,
-		"status":     "ok",
-		"message":    "guest filesystems frozen for snapshot",
+		"kind":          "filesystems_frozen",
+		"request_id":    reqID,
+		"status":        "ok",
+		"message":       "guest filesystems frozen for snapshot",
+		"frozen_mounts": frozen,
 	}
 	s.writeJSON(conn, resp)
 }
@@ -1009,17 +1214,10 @@ func (s *Server) handleThawFilesystems(conn net.Conn, req map[string]any) {
 		return
 	}
 
-	state := getSnapshotState(reqID)
-	state.mu.Lock()
-	if !state.frozen {
-		state.mu.Unlock()
-		s.writeError(conn, 409, "guest filesystems not frozen")
+	if err := thawMounts(reqID); err != nil {
+		s.writeError(conn, 500, err.Error())
 		return
 	}
-	state.frozen = false
-	state.prepared = false
-	state.mu.Unlock()
-	deleteSnapshotState(reqID)
 
 	resp := map[string]any{
 		"kind":       "filesystems_thawed",
@@ -1031,7 +1229,8 @@ func (s *Server) handleThawFilesystems(conn net.Conn, req map[string]any) {
 }
 
 // handleSnapshotReady acknowledges that the Firecracker snapshot has been
-// captured and the guest can resume normal operations.
+// captured and the guest can resume normal operations. It thaws any
+// previously frozen filesystems before acknowledging.
 func (s *Server) handleSnapshotReady(conn net.Conn, req map[string]any) {
 	reqID, _ := req["request_id"].(string)
 	if reqID == "" {
@@ -1039,17 +1238,10 @@ func (s *Server) handleSnapshotReady(conn net.Conn, req map[string]any) {
 		return
 	}
 
-	state := getSnapshotState(reqID)
-	state.mu.Lock()
-	if !state.frozen {
-		state.mu.Unlock()
-		s.writeError(conn, 409, "guest filesystems not frozen")
+	if err := thawMounts(reqID); err != nil {
+		s.writeError(conn, 500, err.Error())
 		return
 	}
-	state.frozen = false
-	state.prepared = false
-	state.mu.Unlock()
-	deleteSnapshotState(reqID)
 
 	resp := map[string]any{
 		"kind":       "snapshot_ready",
@@ -1062,6 +1254,3 @@ func (s *Server) handleSnapshotReady(conn net.Conn, req map[string]any) {
 
 // Protocol version for the snapshot coordination extension.
 const snapshotProtocolVersion = float64(2)
-
-var _ = strings.TrimSpace
-var _ = syscall.Sync

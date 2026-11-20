@@ -3,8 +3,11 @@ package vmm
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -115,3 +118,49 @@ func (t *Transport) SocketPath() string { return t.socketPath }
 
 // CID returns the guest vsock CID this transport targets.
 func (t *Transport) CID() uint32 { return t.cid }
+
+// SendRequest sends a JSON request to the guest agent at the given vsock port
+// and returns the parsed JSON response. It uses length-prefixed framing
+// (4-byte big-endian length + JSON payload) matching the guest agent's vsock
+// server protocol. The context is honored for cancellation and deadlines.
+// The returned net.Conn is closed by SendRequest before returning.
+func (t *Transport) SendRequest(ctx context.Context, port uint32, req map[string]any) (map[string]any, error) {
+	conn, err := t.Dial(ctx, port)
+	if err != nil {
+		return nil, fmt.Errorf("vsock dial: %w", err)
+	}
+	defer conn.Close()
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeFull(conn, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("write request length: %w", err)
+	}
+	if err := writeFull(conn, payload); err != nil {
+		return nil, fmt.Errorf("write request payload: %w", err)
+	}
+
+	var respLenBuf [4]byte
+	if _, err := io.ReadFull(conn, respLenBuf[:]); err != nil {
+		return nil, fmt.Errorf("read response length: %w", err)
+	}
+	frameLen := binary.BigEndian.Uint32(respLenBuf[:])
+	if frameLen == 0 || frameLen > 1<<20 {
+		return nil, fmt.Errorf("invalid response frame length: %d", frameLen)
+	}
+	respPayload := make([]byte, frameLen)
+	if _, err := io.ReadFull(conn, respPayload); err != nil {
+		return nil, fmt.Errorf("read response payload: %w", err)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(respPayload, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+	return resp, nil
+}

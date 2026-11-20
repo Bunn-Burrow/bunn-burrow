@@ -2,6 +2,7 @@ package vmm
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
@@ -89,6 +91,12 @@ type SnapshotInfo struct {
 	// RequestID is the coordination request ID used for guest snapshot
 	// coordination (empty for crash_consistent snapshots).
 	RequestID string `json:"request_id"`
+
+	// ArtifactChecksums maps artifact file paths to their hex-encoded SHA-256
+	// checksums, computed at snapshot creation time. Used to verify artifact
+	// integrity before restore. Empty for legacy snapshots created before
+	// checksums were introduced; such snapshots skip checksum verification.
+	ArtifactChecksums map[string]string `json:"artifact_checksums,omitempty"`
 }
 
 const (
@@ -117,6 +125,135 @@ func m6SnapshotDir(snapRoot, snapID string) string {
 	return filepath.Join(snapRoot, snapID)
 }
 
+// snapshotCleanup tracks resources acquired during snapshot create, restore,
+// and fork operations and releases them in reverse acquisition order on failure.
+// It is safe to call Cleanup multiple times; subsequent calls are no-ops.
+type snapshotCleanup struct {
+	vm *VM
+
+	// Snapshot artifact files (creation paths)
+	snapPath    string
+	memPath     string
+	overlayPath string
+	tmpOverlay  string
+	snapDir     string
+
+	// VM-level resources (restore/fork paths)
+	procStarted  bool
+	transportSet bool
+	nbdMapped    bool
+	destroyVM    bool
+
+	mu   sync.Mutex
+	done bool
+}
+
+func newSnapshotCleanup(vm *VM) *snapshotCleanup {
+	return &snapshotCleanup{vm: vm}
+}
+
+func (c *snapshotCleanup) trackSnapshot(snapPath, memPath, snapDir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snapPath = snapPath
+	c.memPath = memPath
+	c.snapDir = snapDir
+}
+
+func (c *snapshotCleanup) trackOverlay(overlayPath, tmpOverlay string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.overlayPath = overlayPath
+	c.tmpOverlay = tmpOverlay
+}
+
+func (c *snapshotCleanup) trackRestore(procStarted, transportSet, nbdMapped, destroyVM bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.procStarted = procStarted
+	c.transportSet = transportSet
+	c.nbdMapped = nbdMapped
+	c.destroyVM = destroyVM
+}
+
+// Cleanup releases all tracked resources in reverse acquisition order.
+// It is idempotent: subsequent calls after the first are no-ops.
+// Cleanup errors are collected and returned via errors.Join; they are never
+// silently ignored.
+func (c *snapshotCleanup) Cleanup() error {
+	c.mu.Lock()
+	if c.done {
+		c.mu.Unlock()
+		return nil
+	}
+	c.done = true
+	c.mu.Unlock()
+
+	var errs []error
+
+	// Reverse acquisition order:
+
+	// 1. Undo transport binding (unless full VM destroy will handle it).
+	if c.transportSet && c.vm != nil && !c.destroyVM {
+		c.vm.mu.Lock()
+		c.vm.transport = nil
+		c.vm.mu.Unlock()
+	}
+
+	// 2. Kill Firecracker process (unless full VM destroy will handle it).
+	if c.procStarted && c.vm != nil && !c.destroyVM {
+		if proc := c.vm.process(); proc != nil {
+			_ = proc.Kill()
+		}
+	}
+
+	// 3. Full VM destroy (handles process, transport, NBD, sockets, work dir,
+	// writable layer, image, network manager).
+	if c.destroyVM && c.vm != nil {
+		if err := c.vm.destroy(context.Background(), true); err != nil {
+			errs = append(errs, err)
+		}
+	} else if c.nbdMapped && c.vm != nil {
+		// Just unmap NBD without full destroy.
+		if err := c.vm.unmapImage(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// 4. Remove overlay files (not covered by vm.destroy).
+	if c.overlayPath != "" {
+		if err := os.Remove(c.overlayPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove overlay %q: %w", c.overlayPath, err))
+		}
+	}
+	if c.tmpOverlay != "" {
+		if err := os.Remove(c.tmpOverlay); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove temp overlay %q: %w", c.tmpOverlay, err))
+		}
+	}
+
+	// 5. Remove snapshot state and memory artifacts.
+	if c.snapPath != "" {
+		if err := os.Remove(c.snapPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove snapshot state %q: %w", c.snapPath, err))
+		}
+	}
+	if c.memPath != "" {
+		if err := os.Remove(c.memPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove snapshot memory %q: %w", c.memPath, err))
+		}
+	}
+
+	// 6. Remove snapshot directory (if empty after artifact removal).
+	if c.snapDir != "" {
+		if err := os.Remove(c.snapDir); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove snapshot dir %q: %w", c.snapDir, err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
 // CreateSnapshot snapshots the VM. Firecracker only supports snapshotting a
 // paused VM, so the VM must be in the Paused host state. Two artifacts are
 // produced by Firecracker: the microVM state file and the guest memory file.
@@ -137,6 +274,8 @@ func (vm *VM) createSnapshotLegacy(ctx context.Context) (*SnapshotInfo, error) {
 		_ = vm.sm.Transition(StateSnapshotting, StatePaused)
 	}()
 
+	cleanup := newSnapshotCleanup(vm)
+
 	snapDir := snapshotStoreDir(filepath.Dir(vm.res.Dir), vm.id)
 	if err := os.MkdirAll(snapDir, 0750); err != nil {
 		return nil, fmt.Errorf("create snapshot dir: %w", err)
@@ -145,31 +284,40 @@ func (vm *VM) createSnapshotLegacy(ctx context.Context) (*SnapshotInfo, error) {
 	snapID := uuid.NewString()
 	snapshotPath := filepath.Join(snapDir, snapID+".snapshot")
 	memFilePath := filepath.Join(snapDir, snapID+".mem")
-
-	created := []string{}
-	cleanup := func() {
-		for _, p := range created {
-			_ = os.Remove(p)
-		}
-		_ = os.Remove(snapshotPath)
-		_ = os.Remove(memFilePath)
-	}
+	cleanup.trackSnapshot(snapshotPath, memFilePath, snapDir)
 
 	params := &models.SnapshotCreateParams{
 		SnapshotPath: &snapshotPath,
 		MemFilePath:  &memFilePath,
 	}
 	if err := vm.api.CreateSnapshot(ctx, params); err != nil {
-		cleanup()
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+		}
 		return nil, fmt.Errorf("create snapshot: %w", err)
 	}
-	created = append(created, snapshotPath, memFilePath)
 
-	for _, p := range created {
+	for _, p := range []string{snapshotPath, memFilePath} {
 		if err := validateArtifact(p); err != nil {
-			cleanup()
+			if cerr := cleanup.Cleanup(); cerr != nil {
+				vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+			}
 			return nil, fmt.Errorf("snapshot artifact incomplete %q: %w", p, err)
 		}
+	}
+
+	// Compute SHA-256 checksums for all snapshot artifacts so they can be
+	// verified before restore.
+	checksums := make(map[string]string)
+	for _, p := range []string{snapshotPath, memFilePath} {
+		sum, err := computeChecksum(p)
+		if err != nil {
+			if cerr := cleanup.Cleanup(); cerr != nil {
+				vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+			}
+			return nil, fmt.Errorf("compute checksum for %q: %w", p, err)
+		}
+		checksums[p] = sum
 	}
 
 	version := ""
@@ -194,6 +342,7 @@ func (vm *VM) createSnapshotLegacy(ctx context.Context) (*SnapshotInfo, error) {
 		VsockPort:          vm.cfg.VsockPort,
 		KernelImage:        vm.cfg.KernelImage,
 		BootArgs:           vm.cfg.BootArgs,
+		ArtifactChecksums:  checksums,
 	}
 	vm.mu.Lock()
 	vm.snapshot = info
@@ -224,6 +373,8 @@ func (vm *VM) CreateSnapshotWithStore(ctx context.Context, snapStore *SnapshotSt
 		return nil, fmt.Errorf("ensure snapshot dirs: %w", err)
 	}
 
+	cleanup := newSnapshotCleanup(vm)
+
 	snapID := uuid.NewString()
 	snapDir := m6SnapshotDir(snapRoot, snapID)
 	if err := os.MkdirAll(snapDir, 0o750); err != nil {
@@ -232,23 +383,40 @@ func (vm *VM) CreateSnapshotWithStore(ctx context.Context, snapStore *SnapshotSt
 
 	snapshotPath := snapStore.statePath(snapID)
 	memFilePath := snapStore.memPath(snapID)
+	cleanup.trackSnapshot(snapshotPath, memFilePath, snapDir)
 
 	params := &models.SnapshotCreateParams{
 		SnapshotPath: &snapshotPath,
 		MemFilePath:  &memFilePath,
 	}
 	if err := vm.api.CreateSnapshot(ctx, params); err != nil {
-		_ = os.Remove(snapshotPath)
-		_ = os.Remove(memFilePath)
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+		}
 		return nil, fmt.Errorf("create snapshot: %w", err)
 	}
 
 	for _, p := range []string{snapshotPath, memFilePath} {
 		if err := validateArtifact(p); err != nil {
-			_ = os.Remove(snapshotPath)
-			_ = os.Remove(memFilePath)
+			if cerr := cleanup.Cleanup(); cerr != nil {
+				vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+			}
 			return nil, fmt.Errorf("snapshot artifact incomplete %q: %w", p, err)
 		}
+	}
+
+	// Compute SHA-256 checksums for all snapshot artifacts so they can be
+	// verified before restore.
+	checksums := make(map[string]string)
+	for _, p := range []string{snapshotPath, memFilePath} {
+		sum, err := computeChecksum(p)
+		if err != nil {
+			if cerr := cleanup.Cleanup(); cerr != nil {
+				vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+			}
+			return nil, fmt.Errorf("compute checksum for %q: %w", p, err)
+		}
+		checksums[p] = sum
 	}
 
 	version := ""
@@ -273,6 +441,7 @@ func (vm *VM) CreateSnapshotWithStore(ctx context.Context, snapStore *SnapshotSt
 		VsockPort:          vm.cfg.VsockPort,
 		KernelImage:        vm.cfg.KernelImage,
 		BootArgs:           vm.cfg.BootArgs,
+		ArtifactChecksums:  checksums,
 	}
 
 	// For template-based VMs, create a self-contained overlay copy so the
@@ -288,30 +457,38 @@ func (vm *VM) CreateSnapshotWithStore(ctx context.Context, snapStore *SnapshotSt
 
 			snapOverlayPath := filepath.Join(snapDir, snapID+".qcow2")
 			tmpOverlay := snapOverlayPath + ".tmp"
+			cleanup.trackOverlay(snapOverlayPath, tmpOverlay)
 
 			cmd := exec.Command("qemu-img", "convert", "-O", "qcow2", layerInfo.LayerPath, tmpOverlay)
 			if out, err := cmd.CombinedOutput(); err != nil {
-				_ = os.Remove(snapshotPath)
-				_ = os.Remove(memFilePath)
-				_ = os.Remove(tmpOverlay)
+				if cerr := cleanup.Cleanup(); cerr != nil {
+					vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+				}
 				return nil, fmt.Errorf("copy overlay for snapshot: %w\noutput: %s", err, string(out))
 			}
 			if err := os.Rename(tmpOverlay, snapOverlayPath); err != nil {
-				_ = os.Remove(snapshotPath)
-				_ = os.Remove(memFilePath)
-				_ = os.Remove(tmpOverlay)
+				if cerr := cleanup.Cleanup(); cerr != nil {
+					vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+				}
 				return nil, fmt.Errorf("rename snapshot overlay: %w", err)
 			}
 			info.OverlayPath = snapOverlayPath
 			info.NBDDevice = vm.nbdDevice
+
+			overlaySum, err := computeChecksum(snapOverlayPath)
+			if err != nil {
+				if cerr := cleanup.Cleanup(); cerr != nil {
+					vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
+				}
+				return nil, fmt.Errorf("compute checksum for overlay %q: %w", snapOverlayPath, err)
+			}
+			info.ArtifactChecksums[snapOverlayPath] = overlaySum
 		}
 	}
 
 	if err := snapStore.Create(info); err != nil {
-		_ = os.Remove(snapshotPath)
-		_ = os.Remove(memFilePath)
-		if info.OverlayPath != "" {
-			_ = os.Remove(info.OverlayPath)
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("snapshot cleanup failed")
 		}
 		return nil, err
 	}
@@ -327,6 +504,42 @@ func validateArtifact(path string) error {
 	}
 	if fi.Size() == 0 {
 		return fmt.Errorf("artifact is empty")
+	}
+	return nil
+}
+
+// computeChecksum returns the hex-encoded SHA-256 checksum of the file at path,
+// computed via streaming I/O.
+func computeChecksum(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// verifyArtifactChecksums verifies that each artifact listed in snap's
+// ArtifactChecksums matches its stored SHA-256 checksum. If ArtifactChecksums
+// is empty (legacy snapshot), verification is skipped for backward
+// compatibility.
+func verifyArtifactChecksums(snap *SnapshotInfo) error {
+	if len(snap.ArtifactChecksums) == 0 {
+		return nil
+	}
+	for path, expected := range snap.ArtifactChecksums {
+		actual, err := computeChecksum(path)
+		if err != nil {
+			return fmt.Errorf("checksum verification failed for %q: %w", path, err)
+		}
+		if actual != expected {
+			return fmt.Errorf("checksum mismatch for %q: expected %s, got %s", path, expected, actual)
+		}
 	}
 	return nil
 }
@@ -394,7 +607,7 @@ func (s *SnapshotStore) Create(snap *SnapshotInfo) error {
 
 	metaTmp := filepath.Join(snapDir, snapshotMetadataFile+".tmp")
 	metaFinal := s.metadataPath(snap.ID)
-	if err := writeJSONAtomically(metaTmp, metaFinal, snap); err != nil {
+	if err := writeMetadataAtomically(metaTmp, metaFinal, snap); err != nil {
 		return fmt.Errorf("write snapshot metadata: %w", err)
 	}
 	return nil
@@ -459,6 +672,9 @@ func (s *SnapshotStore) Validate(snapID string) error {
 		if err := validateArtifact(snap.OverlayPath); err != nil {
 			return fmt.Errorf("snapshot overlay incomplete %q: %w", snap.OverlayPath, err)
 		}
+	}
+	if err := verifyArtifactChecksums(snap); err != nil {
+		return err
 	}
 	return nil
 }
@@ -538,17 +754,9 @@ type ForkOpts struct {
 // the parent, then restores a new VM from that snapshot with its own identity,
 // working directory, sockets, and (optionally) an isolated writable rootfs
 // copy. The child has an independent lifecycle; destroying the parent never
-// touches child resources.
-//
-// Limitation: Firecracker v1.17.0 captures the vsock host-socket path in a
-// snapshot and restores it during LoadSnapshot, and does not allow the vsock
-// path to be changed before LoadSnapshot ("boot-specific resources") or after
-// the microVM has started ("not supported after starting"). Because the parent
-// must remain alive (Paused) for the fork, it still holds its vsock socket, so
-// the child's LoadSnapshot fails with "Address in use" on the vsock backend.
-// Fork therefore does NOT provide independent vsock for the child in v1.17.0;
-// it is a safe subset (rootfs copy + independent identity/lifecycle) with this
-// documented vsock limitation.
+// touches child resources. The child's vsock UDS path is overridden during
+// snapshot restore so it does not collide with the parent's still-bound
+// vsock socket.
 func (vm *VM) Fork(ctx context.Context, opts ForkOpts) (*VM, error) {
 	if vm.sm.State() != StatePaused {
 		return nil, fmt.Errorf("fork requires parent VM %q to be paused, current state %q", vm.id, vm.sm.State())
@@ -630,36 +838,56 @@ func (vm *VM) Fork(ctx context.Context, opts ForkOpts) (*VM, error) {
 // does NOT call configureDevices; it starts the process, loads the snapshot
 // (which restores machine config, boot source, drives and the vsock
 // host-socket path captured in the snapshot), then validates the guest is
-// running.
-//
-// Note: vsock cannot be reconfigured for the restored VM in v1.17.0 — it is
-// rejected before LoadSnapshot ("boot-specific resources") and after the
-// microVM has started ("not supported after starting"). The child therefore
-// inherits the vsock host-socket path from the snapshot, which conflicts with
-// a still-running parent. Fork with independent vsock is not feasible in
-// v1.17.0 while the parent is alive (see Fork).
+// running. The child's vsock UDS path is overridden during LoadSnapshot using
+// vsock_override so it does not collide with the parent's still-bound socket.
 func restoreVM(ctx context.Context, child *VM, snap *SnapshotInfo) error {
 	if err := child.sm.Transition(StateCreated, StatePreparing); err != nil {
 		return err
 	}
+
+	cleanup := newSnapshotCleanup(child)
+
 	if err := child.startProcessAndWait(ctx); err != nil {
-		return err
+		return fmt.Errorf("start restore Firecracker: %w", err)
+	}
+	cleanup.trackRestore(true, false, false, false)
+
+	if err := verifyArtifactChecksums(snap); err != nil {
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			child.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
+		return fmt.Errorf("snapshot integrity check failed: %w", err)
 	}
 
-	if err := child.api.LoadSnapshot(ctx, &models.SnapshotLoadParams{
-		SnapshotPath: &snap.SnapshotPath,
-		MemFilePath:  snap.MemFilePath,
-		ResumeVM:     true,
-	}); err != nil {
-		child.stopProcLocked()
+	if err := child.api.LoadSnapshotWithOverride(ctx, snap.SnapshotPath, snap.MemFilePath, true, child.res.VsockSock); err != nil {
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			child.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return fmt.Errorf("load snapshot: %w", err)
 	}
 
+	// Bind the host-side vsock transport for the restored VM. Firecracker
+	// v1.17.0 has already bound the vsock device to the child's unique UDS
+	// path via vsock_override during LoadSnapshot; we only need the host-side
+	// transport to dial it. Do NOT call configureVsock here because
+	// PutGuestVsock is rejected after snapshot restoration ("not supported
+	// after starting").
+	child.mu.Lock()
+	child.transport = NewTransport(child.res.VsockSock, child.cfg.VsockCID)
+	child.mu.Unlock()
+	cleanup.trackRestore(true, true, false, false)
+
 	info, err := child.api.GetInstanceInfo(ctx)
 	if err != nil {
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			child.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return fmt.Errorf("inspect restored VM: %w", err)
 	}
 	if info.State == nil || *info.State != "Running" {
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			child.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return fmt.Errorf("restored VM not running, state=%q", safeString(info.State))
 	}
 
@@ -667,8 +895,12 @@ func restoreVM(ctx context.Context, child *VM, snap *SnapshotInfo) error {
 	child.snapshot = snap
 	child.mu.Unlock()
 	if err := child.sm.Transition(StatePreparing, StateRunning); err != nil {
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			child.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return err
 	}
+
 	return nil
 }
 
@@ -773,43 +1005,70 @@ func RestoreSnapshot(ctx context.Context, store *SnapshotStore, snapID string,
 	vm.LayerMgr = lm
 	vm.NBDMgr = nm
 
+	cleanup := newSnapshotCleanup(vm)
+
 	if snap.TemplateID != "" && snap.OverlayPath != "" {
 		if nm == nil {
 			return nil, fmt.Errorf("snapshot %q requires template-based restore but no NBD manager configured", snapID)
 		}
 		nbdDevice, err := nm.Map(ctx, snap.OverlayPath, vm.id)
 		if err != nil {
-			_ = vm.destroy(ctx, true)
+			if cerr := cleanup.Cleanup(); cerr != nil {
+				vm.logger.WithError(cerr).Warn("restore cleanup failed")
+			}
 			return nil, fmt.Errorf("map snapshot overlay to NBD: %w", err)
 		}
 		vm.mu.Lock()
 		vm.nbdDevice = nbdDevice
 		vm.cfg.RootFS = nbdDevice
 		vm.mu.Unlock()
+		cleanup.trackRestore(false, false, true, true)
 	}
 
 	if err := vm.startProcessAndWait(ctx); err != nil {
-		_ = vm.destroy(ctx, true)
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return nil, fmt.Errorf("start restore Firecracker: %w", err)
 	}
+	cleanup.trackRestore(true, false, true, true)
 
-	if err := vm.api.LoadSnapshot(ctx, &models.SnapshotLoadParams{
-		SnapshotPath: &snap.SnapshotPath,
-		MemFilePath:  snap.MemFilePath,
-		ResumeVM:     true,
-	}); err != nil {
-		vm.stopProcLocked()
-		_ = vm.destroy(ctx, true)
+	if err := verifyArtifactChecksums(snap); err != nil {
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
+		return nil, fmt.Errorf("snapshot integrity check failed: %w", err)
+	}
+
+	if err := vm.api.LoadSnapshotWithOverride(ctx, snap.SnapshotPath, snap.MemFilePath, true, vm.res.VsockSock); err != nil {
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
 
+	// Bind the host-side vsock transport for the restored VM. Firecracker
+	// v1.17.0 has already bound the vsock device to the restored VM's unique
+	// UDS path via vsock_override during LoadSnapshot; we only need the
+	// host-side transport to dial it. Do NOT call configureVsock here because
+	// PutGuestVsock is rejected after snapshot restoration ("not supported
+	// after starting").
+	vm.mu.Lock()
+	vm.transport = NewTransport(vm.res.VsockSock, vm.cfg.VsockCID)
+	vm.mu.Unlock()
+	cleanup.trackRestore(true, true, true, true)
+
 	info, err := vm.api.GetInstanceInfo(ctx)
 	if err != nil {
-		_ = vm.destroy(ctx, true)
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return nil, fmt.Errorf("inspect restored VM: %w", err)
 	}
 	if info.State == nil || *info.State != "Running" {
-		_ = vm.destroy(ctx, true)
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return nil, fmt.Errorf("restored VM not running, state=%q", safeString(info.State))
 	}
 
@@ -817,7 +1076,9 @@ func RestoreSnapshot(ctx context.Context, store *SnapshotStore, snapID string,
 	vm.snapshot = snap
 	vm.mu.Unlock()
 	if err := vm.sm.Transition(StatePreparing, StateRunning); err != nil {
-		_ = vm.destroy(ctx, true)
+		if cerr := cleanup.Cleanup(); cerr != nil {
+			vm.logger.WithError(cerr).Warn("restore cleanup failed")
+		}
 		return nil, fmt.Errorf("finalize restore: %w", err)
 	}
 
@@ -854,15 +1115,78 @@ func safeString(s *string) string {
 }
 
 // writeJSONAtomically marshals v to tmpPath then renames to finalPath.
-func writeJSONAtomically(tmpPath, finalPath string, v any) error {
+// writeMetadataAtomically publishes v as JSON to finalPath using a
+// crash-durable sequence: marshal to a temp file in the same directory,
+// write all data, fsync the file, close it, atomically rename into place,
+// then fsync the containing directory where supported.
+//
+// Restrictive file permissions (0o600) are used so the metadata file is
+// only readable/writable by the owning user. If any step fails, the temp
+// file is removed and any previously published metadata at finalPath is
+// preserved (rename is atomic and only replaces finalPath on success).
+func writeMetadataAtomically(tmpPath, finalPath string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+
+	dir := filepath.Dir(finalPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, finalPath)
+
+	// Write to temp file with restrictive permissions.
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+
+	// Ensure the complete metadata is written.
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	// Sync file contents to disk before renaming.
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	// Atomically rename temp file into place.
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	// Sync the containing directory where supported so the rename is
+	// durable across crashes.
+	if err := syncDir(dir); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// syncDir fsyncs the directory at dir where supported. On Linux this
+// persists the directory entry rename to disk.
+func syncDir(dir string) error {
+	df, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	if err := df.Sync(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // snapshotStoreAdapter adapts *SnapshotStore to the storage.SnapshotStore

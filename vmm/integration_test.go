@@ -187,3 +187,81 @@ func TestIntegrationSnapshot(t *testing.T) {
 func vmResLog(base string) string {
 	return base + "/firecracker.log"
 }
+
+// TestRestoreSnapshotTransport verifies that RestoreSnapshot binds a
+// host-side vsock transport on the restored VM, using the restored VM's
+// unique vsock socket path rather than the source VM's path.
+func TestRestoreSnapshotTransport(t *testing.T) {
+	bin, kernel, rootfs, ok := integrationAssets()
+	if !ok {
+		t.Skip("integration assets not present")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	cfg := DefaultConfig()
+	cfg.BinPath = bin
+	cfg.KernelImage = kernel
+	cfg.RootFS = rootfs
+	cfg.WorkDir = t.TempDir()
+	cfg.VCPU = 1
+	cfg.MemSizeMiB = 256
+	cfg.LogFile = vmResLog(cfg.WorkDir)
+	cfg.StartTimeout = 20 * time.Second
+	cfg.StopTimeout = 10 * time.Second
+	cfg.StopGraceTimeout = 5 * time.Second
+
+	source, err := New(cfg, nil)
+	require.NoError(t, err)
+	require.NoError(t, source.Start(ctx))
+	requireGuestBooted(t, source)
+
+	require.NoError(t, source.Pause(ctx))
+	require.Equal(t, StatePaused, source.State())
+
+	snap, err := source.CreateSnapshot(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, source.Stop(ctx))
+	require.NoError(t, source.Destroy(ctx))
+
+	// Build M6-layout snapshot from the legacy snapshot artifacts.
+	store := NewSnapshotStore(filepath.Join(t.TempDir(), "snapshots"))
+	m6Snap := &SnapshotInfo{
+		ID:           snap.ID,
+		SourceVM:     snap.SourceVM,
+		SnapshotPath: store.statePath(snap.ID),
+		MemFilePath:  store.memPath(snap.ID),
+		RootFSPath:   snap.RootFSPath,
+		VCPU:         snap.VCPU,
+		MemSizeMiB:   snap.MemSizeMiB,
+		VsockCID:     snap.VsockCID,
+		VsockPort:    snap.VsockPort,
+		KernelImage:  snap.KernelImage,
+		BootArgs:     snap.BootArgs,
+		Status:       snapshotStatusReady,
+	}
+	snapDir := filepath.Join(store.baseDir, m6Snap.ID)
+	require.NoError(t, os.MkdirAll(snapDir, 0o750))
+	require.NoError(t, copyFile(snap.SnapshotPath, m6Snap.SnapshotPath))
+	require.NoError(t, copyFile(snap.MemFilePath, m6Snap.MemFilePath))
+	require.NoError(t, store.Create(m6Snap))
+
+	restored, err := RestoreSnapshot(ctx, store, m6Snap.ID, nil, nil, nil, RestoreOpts{
+		WorkDir:  t.TempDir(),
+		VsockCID: 6,
+	}, nil)
+	require.NoError(t, err)
+	defer func() { _ = restored.Destroy(context.Background()) }()
+
+	require.Equal(t, StateRunning, restored.State())
+	require.NotNil(t, restored.Vsock(), "restored VM should have vsock transport")
+	require.NotEqual(t, source.Vsock().SocketPath(), restored.Vsock().SocketPath(),
+		"source and restored vsock socket paths must differ")
+	require.Equal(t, restored.res.VsockSock, restored.Vsock().SocketPath(),
+		"restored transport should use its own vsock socket path")
+	require.Equal(t, uint32(6), restored.Vsock().CID(), "restored VM should have requested CID")
+
+	require.NoError(t, restored.Stop(ctx))
+}

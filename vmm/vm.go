@@ -160,11 +160,13 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 
 	// Create the user-owned VM storage base and an exclusive per-VM directory.
 	// The exclusive mkdir prevents a reused ID from adopting or later deleting
-	// files belonging to an earlier VM.
+	// files belonging to an earlier VM. MkdirAll is used (rather than Mkdir)
+	// so that Fork can pre-create the directory and copy the rootfs into it
+	// before New() is called.
 	if err := os.MkdirAll(cfg.WorkDir, 0700); err != nil {
 		return nil, fmt.Errorf("create VM storage directory %q: %w", cfg.WorkDir, err)
 	}
-	if err := os.Mkdir(vm.res.Dir, 0700); err != nil {
+	if err := os.MkdirAll(vm.res.Dir, 0700); err != nil {
 		return nil, fmt.Errorf("create VM working directory: %w", err)
 	}
 	return vm, nil
@@ -236,7 +238,9 @@ func (vm *VM) Start(ctx context.Context) (startErr error) {
 	var imageAttached bool
 	defer func() {
 		if layerCreated && vm.State() != StateRunning {
-			vm.removeWritableLayer()
+			if err := vm.removeWritableLayer(); err != nil {
+				vm.logger.WithError(err).Warn("remove writable layer on startup failure")
+			}
 		}
 		if networkAllocated && vm.State() != StateRunning {
 			if err := vm.releaseNetwork(); err != nil {
@@ -254,7 +258,9 @@ func (vm *VM) Start(ctx context.Context) (startErr error) {
 			}
 		}
 		if imageAttached && vm.State() != StateRunning {
-			vm.unmapImage()
+			if err := vm.unmapImage(); err != nil {
+				vm.logger.WithError(err).Warn("unmap image on startup failure")
+			}
 		}
 	}()
 
@@ -803,13 +809,23 @@ func (vm *VM) Stop(ctx context.Context) error {
 	vm.mu.Unlock()
 
 	if err := vm.sm.Transition(state, StateStopping); err != nil {
+		// The state may have changed to Destroyed by a concurrent Destroy().
+		if vm.sm.State() == StateDestroyed {
+			return nil
+		}
 		return fmt.Errorf("stop: %w", err)
 	}
 
-	// Attempt graceful guest shutdown.
-	_ = vm.api.CreateSyncAction(ctx, &models.InstanceActionInfo{
-		ActionType: instanceActionPtr(models.InstanceActionInfoActionTypeSendCtrlAltDel),
-	})
+	// Attempt graceful guest shutdown. Copy vm.api under the mutex to avoid
+	// a race with Destroy() which may set vm.api to nil.
+	vm.mu.Lock()
+	api := vm.api
+	vm.mu.Unlock()
+	if api != nil {
+		_ = api.CreateSyncAction(ctx, &models.InstanceActionInfo{
+			ActionType: instanceActionPtr(models.InstanceActionInfoActionTypeSendCtrlAltDel),
+		})
+	}
 
 	// Wait for graceful shutdown.
 	terminated := false
@@ -872,9 +888,15 @@ func (vm *VM) Stop(ctx context.Context) error {
 			vm.logger.WithError(err).Warn("volume detach during stop")
 		}
 
-		vm.unmapImage()
+		if err := vm.unmapImage(); err != nil {
+			vm.logger.WithError(err).Warn("unmap image during stop")
+		}
 
 		if err := vm.sm.Transition(StateStopping, StateStopped); err != nil {
+			// Destroy() may have transitioned to Destroyed concurrently.
+			if vm.sm.State() == StateDestroyed {
+				return nil
+			}
 			return fmt.Errorf("finalize stop: %w", err)
 		}
 
@@ -900,10 +922,11 @@ func (vm *VM) Stop(ctx context.Context) error {
 
 // Destroy ensures the VM cannot keep running, closes sockets, and removes
 // VM-owned temporary artifacts. Shared kernel/rootfs artifacts are preserved.
-// Idempotent and safe to retry after partial cleanup. Attempts graceful shutdown
-// first, force-terminates any still-running process, then removes socket files and
-// the working-directory contents. Cleanup errors are collected and returned; they
-// are never silently ignored.
+// Idempotent and safe to retry after partial cleanup. Handles all lifecycle
+// states, including intermediate ones (Preparing, Snapshotting, Stopping,
+// Created, Destroying). For any state where the Firecracker process may still
+// be running, the process is terminated before resource cleanup. Cleanup
+// errors are collected and returned; they are never silently ignored.
 func (vm *VM) Destroy(ctx context.Context) error {
 	vm.mu.Lock()
 	state := vm.sm.State()
@@ -913,21 +936,41 @@ func (vm *VM) Destroy(ctx context.Context) error {
 		return nil
 	}
 
-	// Best-effort graceful shutdown first, while the state machine still
-	// reflects a stoppable state.
+	if state == StateDestroying {
+		// Already being destroyed; concurrent callers return nil.
+		return nil
+	}
+
+	// Handle state-specific pre-cleanup. For states where the Firecracker
+	// process may be running, terminate it before releasing resources.
 	switch state {
 	case StateRunning, StatePaused:
-		_ = vm.Stop(ctx)
-	case StateFailed:
+		// Best-effort graceful shutdown first, then fall through to
+		// force-termination below.
+		if err := vm.Stop(ctx); err != nil {
+			vm.logger.WithError(err).Warn("graceful stop before destroy")
+		}
+	case StateStopping:
+		// An existing stop is in progress. Don't wait for it; proceed with
+		// our own cleanup. vm.mu protects shared state, and os.Remove is
+		// idempotent, so concurrent cleanup is safe.
+	case StatePreparing, StateSnapshotting, StateFailed:
+		// Process may be running; force-terminate it.
 		if proc := vm.process(); proc != nil {
 			_ = proc.Kill()
 		}
+	case StateCreated:
+		// No process started; nothing to terminate.
 	}
 
-	// Mark Destroying so an unexpected process exit is not reported as a
-	// lifecycle failure; then force-terminate anything still running.
-	vm.sm.TransitionTo(StateDestroying)
+	// Mark Destroying so unexpected process exits are not reported as
+	// lifecycle failures. Skip for StateStopping: Stop owns its own
+	// transition to Stopped; Destroy will finalize to Destroyed below.
+	if state != StateStopping {
+		vm.sm.TransitionTo(StateDestroying)
+	}
 
+	// Force-terminate anything still running after state-specific handling.
 	if proc := vm.process(); proc != nil {
 		_ = proc.Kill()
 		select {
@@ -954,10 +997,12 @@ func (vm *VM) Destroy(ctx context.Context) error {
 	if err := vm.removeOwnedArtifacts(); err != nil {
 		errs = append(errs, fmt.Errorf("remove artifacts: %w", err))
 	}
-
-	vm.removeWritableLayer()
-	vm.unmapImage()
-
+	if err := vm.removeWritableLayer(); err != nil {
+		errs = append(errs, fmt.Errorf("remove writable layer: %w", err))
+	}
+	if err := vm.unmapImage(); err != nil {
+		errs = append(errs, fmt.Errorf("unmap image: %w", err))
+	}
 	if err := vm.shutDownNetworkMgr(); err != nil {
 		errs = append(errs, fmt.Errorf("shutdown network manager: %w", err))
 	}
@@ -1099,7 +1144,8 @@ func (vm *VM) resolveTemplate(ctx context.Context) error {
 // removeWritableLayer releases this VM's writable layer, NBD mapping, and
 // coordinates with the StorageManager to release template references and
 // overlay metadata. It is idempotent and safe to call after partial creation.
-func (vm *VM) removeWritableLayer() {
+// Cleanup errors are collected and returned.
+func (vm *VM) removeWritableLayer() error {
 	vm.mu.Lock()
 	layer := vm.writableLayer
 	nbdDevice := vm.nbdDevice
@@ -1109,37 +1155,48 @@ func (vm *VM) removeWritableLayer() {
 	vm.mu.Unlock()
 
 	if layer == "" && nbdDevice == "" {
-		return
+		return nil
 	}
 
 	vm.logger.Info("releasing VM writable layer",
 		map[string]any{"vm_id": vm.id, "layer_path": layer, "nbd_device": nbdDevice, "template_id": templateID})
 
+	var errs []error
+
 	// Unmap the NBD device (stops qemu-nbd) if one was mapped.
 	if vm.NBDMgr != nil && nbdDevice != "" {
-		_ = vm.NBDMgr.Unmap(vm.id)
+		if err := vm.NBDMgr.Unmap(vm.id); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if vm.StorageManager != nil {
 		// The StorageManager owns overlay metadata, backing-image references,
 		// and template references. ReleaseVM handles all of them atomically.
-		_ = vm.StorageManager.ReleaseVM(vm.id)
+		if err := vm.StorageManager.ReleaseVM(vm.id); err != nil {
+			errs = append(errs, err)
+		}
 		// Remove the layer file itself (metadata is deleted by ReleaseVM).
 		if layer != "" {
-			_ = os.Remove(layer)
+			if err := os.Remove(layer); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
 		}
-		return
+		return errors.Join(errs...)
 	}
 
 	// Backward-compatible path: no StorageManager. Remove layer metadata and
 	// file, and release the template reference directly.
 	if vm.LayerMgr != nil && layer != "" {
-		_ = vm.LayerMgr.RemoveLayer(vm.id)
+		if err := vm.LayerMgr.RemoveLayer(vm.id); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if vm.TemplateStore != nil {
 		// The template ID is still in cfg.TemplateID at this point.
 		vm.TemplateStore.Release(vm.cfg.TemplateID)
 	}
+	return errors.Join(errs...)
 }
 
 // resolveImage resolves the configured image, maps its qcow2 file to an NBD
@@ -1182,7 +1239,7 @@ func (vm *VM) resolveImage(ctx context.Context) error {
 }
 
 // unmapImage unmaps the image NBD device and clears the RootFS reference.
-func (vm *VM) unmapImage() {
+func (vm *VM) unmapImage() error {
 	vm.mu.Lock()
 	nbdDevice := vm.imageNBDDevice
 	vm.imageNBDDevice = ""
@@ -1190,12 +1247,15 @@ func (vm *VM) unmapImage() {
 	vm.mu.Unlock()
 
 	if nbdDevice == "" {
-		return
+		return nil
 	}
 
 	if vm.NBDMgr != nil {
-		_ = vm.NBDMgr.Unmap(vm.id)
+		if err := vm.NBDMgr.Unmap(vm.id); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // process returns the current Firecracker process handle, or nil if not started.
@@ -1230,17 +1290,28 @@ func (vm *VM) IsRunning() bool { return vm.sm.State() == StateRunning }
 
 // destroy is an internal destroy used by fork failure cleanup. If force is set,
 // the Firecracker process is killed before cleanup. It releases runtime resources
-// and removes owned artifacts, then transitions to Destroyed.
+// and removes owned artifacts, then transitions to Destroyed. Cleanup errors are
+// collected and returned.
 func (vm *VM) destroy(ctx context.Context, force bool) error {
 	if force {
 		if proc := vm.process(); proc != nil {
 			_ = proc.Kill()
 		}
 	}
-	_ = vm.releaseRuntime()
-	_ = vm.removeOwnedArtifacts()
-	vm.removeWritableLayer()
+	var errs []error
+	if err := vm.releaseRuntime(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := vm.removeOwnedArtifacts(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := vm.removeWritableLayer(); err != nil {
+		errs = append(errs, err)
+	}
 	vm.sm.TransitionTo(StateDestroyed)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	return nil
 }
 

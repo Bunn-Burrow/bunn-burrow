@@ -85,22 +85,6 @@ func (s *StateMachine) State() State {
 	return s.state
 }
 
-// Waiting returns a channel that is closed when the state changes. Callers
-// should re-read State() after the channel closes. Passing a nil channel
-// disables waiting.
-func (s *StateMachine) Waiting() <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ch := make(chan struct{})
-	go func() {
-		s.cond.L.Lock()
-		s.cond.Wait()
-		s.cond.L.Unlock()
-		close(ch)
-	}()
-	return ch
-}
-
 // Transition attempts to move from one of the given current states to the
 // target state. It returns ErrInvalidTransition if the current state does not
 // permit the transition. On success the state is updated and waiters are

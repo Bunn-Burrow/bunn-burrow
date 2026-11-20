@@ -11,7 +11,7 @@ import (
 
 func TestTemporaryAlpineForkRestore(t *testing.T) {
 	if os.Getenv("BUNN_RUN_FIRECRACKER_SNAPSHOT_TEST") != "1" {
-		t.Skip("requires explicit opt-in; Firecracker v1.17.0 snapshot restore has a known vsock socket conflict")
+		t.Skip("requires explicit opt-in; set BUNN_RUN_FIRECRACKER_SNAPSHOT_TEST=1 to run Firecracker integration tests")
 	}
 	bin, kernel, rootfs, ok := integrationAssets()
 	if !ok {
@@ -60,6 +60,17 @@ func TestTemporaryAlpineForkRestore(t *testing.T) {
 	require.NotEqual(t, parent.ID(), child.ID())
 	require.Equal(t, StateRunning, child.State())
 	require.NotZero(t, child.PID())
+
+	// Parent and child each have their own vsock transport bound to unique
+	// socket paths; no collision between the still-running parent and the
+	// restored child.
+	require.NotNil(t, parent.Vsock(), "parent should have vsock transport")
+	require.NotNil(t, child.Vsock(), "child should have vsock transport")
+	require.NotEqual(t, parent.Vsock().SocketPath(), child.Vsock().SocketPath(),
+		"parent and child vsock socket paths must differ")
+	require.Equal(t, child.res.VsockSock, child.Vsock().SocketPath(),
+		"child transport should use its own vsock socket path")
+	require.Equal(t, uint32(4), child.Vsock().CID(), "child should have requested CID")
 
 	require.NoError(t, child.Stop(ctx))
 	require.NoError(t, parent.Resume(ctx))
