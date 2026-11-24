@@ -41,7 +41,7 @@ type VM struct {
 	logger    *logrus.Entry
 
 	// TemplateStore resolves templates for template-based VM creation. Optional;
-	// when nil, only direct rootfs creation is supported (backward compatible).
+	// when nil, only direct rootfs creation is supported.
 	TemplateStore *template.Store
 	// LayerMgr creates per-VM writable layers. Optional; when nil, template
 	// based VM creation is unavailable.
@@ -49,7 +49,7 @@ type VM struct {
 	// NBDMgr maps qcow2 overlays to NBD block devices for Firecracker.
 	// Optional; when nil, template-based VM creation passes the qcow2 path
 	// directly (not supported by Firecracker natively).
-	NBDMgr *storage.NBDManager
+	NBDMgr storage.NBDManager
 	// StorageManager tracks persistent storage resources for this VM.
 	// Optional; when nil, storage lifecycle tracking is disabled.
 	StorageManager *storage.StorageManager
@@ -84,16 +84,30 @@ type VM struct {
 	// attachedVolumes tracks NBD device paths for volumes attached to this VM.
 	// They are detached on Stop/Destroy.
 	attachedVolumes []string
+
+	// onDestroy is called when the VM is destroyed, allowing the Runtime
+	// to track VM lifecycle. Optional; when nil, no callback is invoked.
+	onDestroy func(id string)
 }
 
 // New creates a VM in the Created state. It validates configuration, allocates
-// a unique VM ID and private working directory, and reserves unique API and
-// vsock socket paths. Firecracker is not started.
+// a unique VM ID and private working directory, and assigns a unique vsock CID
+// if not explicitly set. Firecracker is not started.
 func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 	if logger == nil {
 		l := logrus.New()
 		l.SetOutput(os.Stderr)
 		logger = l.WithField("component", "vmm")
+	}
+
+	// Assign a unique vsock CID if not explicitly set, so multiple VMs can
+	// coexist on the same host without vsock CID collisions.
+	if cfg.VsockCID == 0 {
+		cfg.VsockCID = nextVsockCID()
+	}
+	// Assign a vsock port if not explicitly set.
+	if cfg.VsockPort == 0 {
+		cfg.VsockPort = GuestAgentVsockPort
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -130,6 +144,15 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 		sm:     NewStateMachine(),
 		exitCh: make(chan struct{}),
 		logger: logger.WithField("vm", id),
+
+		NetworkManager:  cfg.NetworkManager,
+		VolumeManager:   cfg.VolumeManager,
+		ImageManager:    cfg.ImageManager,
+		TemplateManager: cfg.TemplateManager,
+		TemplateStore:   cfg.TemplateStore,
+		LayerMgr:        cfg.LayerManager,
+		NBDMgr:          cfg.NBDManager,
+		StorageManager:  cfg.StorageManager,
 	}
 
 	// If networking is configured but no shared network manager is provided,
@@ -141,21 +164,6 @@ func New(cfg Config, logger *logrus.Entry) (*VM, error) {
 		}
 		vm.NetworkManager = mgr
 		vm.ownNetworkMgr = true
-	}
-
-	// Use the configured volume manager if provided.
-	if cfg.VolumeManager != nil {
-		vm.VolumeManager = cfg.VolumeManager
-	}
-
-	// Use the configured image manager if provided.
-	if cfg.ImageManager != nil {
-		vm.ImageManager = cfg.ImageManager
-	}
-
-	// Use the configured template manager if provided.
-	if cfg.TemplateManager != nil {
-		vm.TemplateManager = cfg.TemplateManager
 	}
 
 	// Create the user-owned VM storage base and an exclusive per-VM directory.
@@ -1015,6 +1023,11 @@ func (vm *VM) Destroy(ctx context.Context) error {
 
 	vm.sm.TransitionTo(StateDestroyed)
 
+	// Invoke onDestroy callback if set (Runtime uses this to track VMs).
+	if vm.onDestroy != nil {
+		vm.onDestroy(vm.id)
+	}
+
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
@@ -1264,6 +1277,14 @@ func (vm *VM) process() *Process {
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 	return vm.proc
+}
+
+// SetOnDestroy sets a callback invoked when the VM is destroyed. The Runtime
+// uses this to track VM lifecycle and remove destroyed VMs from its registry.
+func (vm *VM) SetOnDestroy(fn func(id string)) {
+	vm.mu.Lock()
+	vm.onDestroy = fn
+	vm.mu.Unlock()
 }
 
 // Wait blocks until the Firecracker process exits or ctx is cancelled. It

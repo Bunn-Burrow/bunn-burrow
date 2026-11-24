@@ -118,22 +118,26 @@ type Sandbox struct {
 
 // NewSandbox creates a sandboxed VM in the Created state. It validates config,
 // allocates a unique VM ID and private working directory, and assigns a unique
-// vsock CID when VsockCID is zero. Firecracker is not started.
+// vsock CID. Firecracker is not started.
 func NewSandbox(cfg Config) (*Sandbox, error) {
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid sandbox config: %w", err)
-	}
-
 	// Always assign a unique vsock CID so multiple sandboxes can coexist on
 	// the same host without vsock CID collisions.
 	cfg.VsockCID = nextVsockCID()
+
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid sandbox config: %w", err)
+	}
 
 	vm, err := New(cfg, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Sandbox{vm: vm, cfg: cfg}, nil
+	return &Sandbox{
+		vm:              vm,
+		cfg:             cfg,
+		TemplateManager: vm.TemplateManager,
+	}, nil
 }
 
 // Start boots the VM and waits for it to reach the Running state. It must be

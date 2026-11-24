@@ -2,12 +2,79 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// fakeNBDManager is a test double for NBDManager that records mappings in
+// memory without invoking qemu-nbd. It allows volume attach/detach tests to
+// run without root privileges or /dev/nbd* kernel devices.
+type fakeNBDManager struct {
+	mu      sync.Mutex
+	devices map[string]string // vmID -> devicePath
+	images  map[string]string // devicePath -> imagePath
+	nextNBD int
+}
+
+func newFakeNBDManager() *fakeNBDManager {
+	return &fakeNBDManager{
+		devices: make(map[string]string),
+		images:  make(map[string]string),
+		nextNBD: 0,
+	}
+}
+
+func (f *fakeNBDManager) Map(ctx context.Context, imagePath, vmID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if d, ok := f.devices[vmID]; ok {
+		return d, nil // already mapped for this VM
+	}
+	f.nextNBD++
+	device := fmt.Sprintf("/dev/nbd%d", f.nextNBD)
+	f.devices[vmID] = device
+	f.images[device] = imagePath
+	return device, nil
+}
+
+func (f *fakeNBDManager) Unmap(vmID string) error {
+	return f.UnmapContext(context.Background(), vmID)
+}
+
+func (f *fakeNBDManager) UnmapContext(ctx context.Context, vmID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d, ok := f.devices[vmID]
+	if !ok {
+		return nil // idempotent
+	}
+	delete(f.devices, vmID)
+	delete(f.images, d)
+	return nil
+}
+
+func (f *fakeNBDManager) DevicePath(vmID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.devices[vmID]
+}
+
+func (f *fakeNBDManager) IsMapped(vmID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.devices[vmID]
+	return ok
+}
+
+// ReconcileNBD is a no-op for the fake NBD manager.
+func (f *fakeNBDManager) ReconcileNBD(ctx context.Context) (*NBDReconcileReport, error) {
+	return &NBDReconcileReport{}, nil
+}
 
 func nbdaAvailable() bool {
 	_, err := os.Stat("/dev/nbd0")
@@ -20,20 +87,20 @@ func skipIfNoNBD(t *testing.T) {
 	}
 }
 
+func newTestVolumeManager(t *testing.T, dir string) *VolumeManager {
+	layerMgr := NewLayerManager(dir, nil)
+	nbdMgr := newFakeNBDManager()
+	metaStore := NewMetadataStore(dir)
+	vm := NewVolumeManager(DefaultVolumeConfig(dir), layerMgr, nbdMgr, metaStore)
+	require.NoError(t, vm.EnsureDirs())
+	return vm
+}
+
 func TestVolumeConfigDefaults(t *testing.T) {
 	cfg := DefaultVolumeConfig(t.TempDir())
 	require.Greater(t, cfg.DefaultSizeBytes, int64(0))
 	require.Greater(t, cfg.MaxSizeBytes, cfg.DefaultSizeBytes)
 	require.Greater(t, cfg.DefaultSizeBytes, cfg.MinSizeBytes)
-}
-
-func newTestVolumeManager(t *testing.T, dir string) *VolumeManager {
-	layerMgr := NewLayerManager(dir, nil)
-	nbdMgr := NewNBDManager(0, 16, filepath.Join(dir, "nbd"), filepath.Join(dir, "locks"))
-	metaStore := NewMetadataStore(dir)
-	vm := NewVolumeManager(DefaultVolumeConfig(dir), layerMgr, nbdMgr, metaStore)
-	require.NoError(t, vm.EnsureDirs())
-	return vm
 }
 
 func TestVolumeManagerCreateAndInspect(t *testing.T) {
@@ -167,7 +234,6 @@ func TestVolumeManagerDeleteVolume(t *testing.T) {
 }
 
 func TestVolumeManagerDeleteAttachedVolumeRejected(t *testing.T) {
-	skipIfNoNBD(t)
 	dir := t.TempDir()
 	vm := newTestVolumeManager(t, dir)
 
@@ -194,7 +260,6 @@ func TestVolumeManagerDeleteAttachedVolumeRejected(t *testing.T) {
 }
 
 func TestVolumeManagerAttachDetach(t *testing.T) {
-	skipIfNoNBD(t)
 	dir := t.TempDir()
 	vm := newTestVolumeManager(t, dir)
 
@@ -237,7 +302,6 @@ func TestVolumeManagerAttachDetach(t *testing.T) {
 }
 
 func TestVolumeManagerDuplicateAttachRejected(t *testing.T) {
-	skipIfNoNBD(t)
 	dir := t.TempDir()
 	vm := newTestVolumeManager(t, dir)
 
@@ -285,7 +349,6 @@ func TestVolumeManagerDetachNotAttached(t *testing.T) {
 }
 
 func TestVolumeManagerDetachVMVolumes(t *testing.T) {
-	skipIfNoNBD(t)
 	dir := t.TempDir()
 	vm := newTestVolumeManager(t, dir)
 
@@ -329,11 +392,9 @@ func TestVolumeManagerRecover(t *testing.T) {
 	_, err := vm1.CreateVolume("recover-vol", 0, nil, nil)
 	require.NoError(t, err)
 
-	// Attach before recovery (skip if no NBD).
-	if nbdaAvailable() {
-		_, err = vm1.AttachVolume(context.Background(), "recover-vol", "recover-vm")
-		require.NoError(t, err)
-	}
+	// Attach before recovery.
+	_, err = vm1.AttachVolume(context.Background(), "recover-vol", "recover-vm")
+	require.NoError(t, err)
 
 	// Create a new VolumeManager (simulating process restart) and recover.
 	vm2 := newTestVolumeManager(t, dir)
@@ -343,18 +404,13 @@ func TestVolumeManagerRecover(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, inspected)
 	require.Equal(t, VolumeStateActive, inspected.State)
+	require.Equal(t, "", inspected.AttachedVMID)
 
-	// If NBD was available, check attachment was recovered.
-	if nbdaAvailable() {
-		require.Equal(t, VolumeStateAttached, inspected.State)
-		require.Equal(t, "recover-vm", inspected.AttachedVMID)
-
-		// Attachment index should be rebuilt.
-		volForVM, err := vm2.GetVolumeForVM("recover-vm")
-		require.NoError(t, err)
-		require.NotNil(t, volForVM)
-		require.Equal(t, "recover-vol", volForVM.ID)
-	}
+	// Attachment index should NOT be rebuilt from metadata (NBD mapping is
+	// runtime state, not persisted).
+	volForVM, err := vm2.GetVolumeForVM("recover-vm")
+	require.NoError(t, err)
+	require.Nil(t, volForVM)
 }
 
 func TestVolumeManagerSizeFromFile(t *testing.T) {
@@ -392,7 +448,7 @@ func TestVolumeManagerAttachNilNBDManager(t *testing.T) {
 func TestVolumeManagerDeleteAttachedFromMetadata(t *testing.T) {
 	dir := t.TempDir()
 	layerMgr := NewLayerManager(dir, nil)
-	nbdMgr := NewNBDManager(0, 16, filepath.Join(dir, "nbd"), filepath.Join(dir, "locks"))
+	nbdMgr := newFakeNBDManager()
 	metaStore := NewMetadataStore(dir)
 	vm := NewVolumeManager(DefaultVolumeConfig(dir), layerMgr, nbdMgr, metaStore)
 	require.NoError(t, vm.EnsureDirs())
@@ -430,7 +486,7 @@ func TestVolumeManagerDeleteAttachedFromMetadata(t *testing.T) {
 func TestVolumeManagerSizePreservedThroughRecover(t *testing.T) {
 	dir := t.TempDir()
 	layerMgr := NewLayerManager(dir, nil)
-	nbdMgr := NewNBDManager(0, 16, filepath.Join(dir, "nbd"), filepath.Join(dir, "locks"))
+	nbdMgr := newFakeNBDManager()
 	metaStore := NewMetadataStore(dir)
 
 	vm1 := NewVolumeManager(DefaultVolumeConfig(dir), layerMgr, nbdMgr, metaStore)
@@ -453,7 +509,7 @@ func TestVolumeManagerSizePreservedThroughRecover(t *testing.T) {
 func TestVolumeManagerRecoverDoesNotRebuildAttachments(t *testing.T) {
 	dir := t.TempDir()
 	layerMgr := NewLayerManager(dir, nil)
-	nbdMgr := NewNBDManager(0, 16, filepath.Join(dir, "nbd"), filepath.Join(dir, "locks"))
+	nbdMgr := newFakeNBDManager()
 	metaStore := NewMetadataStore(dir)
 
 	vm1 := NewVolumeManager(DefaultVolumeConfig(dir), layerMgr, nbdMgr, metaStore)

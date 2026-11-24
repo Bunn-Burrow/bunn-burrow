@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bunn-Burrow/bunn-burrow/internal/network"
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 	"github.com/stretchr/testify/require"
 )
@@ -2404,4 +2405,107 @@ func TestForkFailureCleanupUnit(t *testing.T) {
 
 	// Parent's transport should still be intact.
 	require.NotNil(t, parent.Vsock())
+}
+
+// TestVMDependenciesAssigned verifies all 8 manager dependencies are assigned
+// from Config to VM via New().
+func TestVMDependenciesAssigned(t *testing.T) {
+	cfg := testConfig(t)
+	vm, err := New(cfg, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		// No Firecracker was started, so just clean up the work dir.
+		os.RemoveAll(vm.res.Dir)
+	})
+
+	require.Nil(t, vm.NetworkManager)
+	require.Nil(t, vm.VolumeManager)
+	require.Nil(t, vm.ImageManager)
+	require.Nil(t, vm.TemplateManager)
+	require.Nil(t, vm.TemplateStore)
+	require.Nil(t, vm.LayerMgr)
+	require.Nil(t, vm.NBDMgr)
+	require.Nil(t, vm.StorageManager)
+}
+
+// TestVMDependenciesAssignedNonNil verifies that non-nil dependency values
+// are assigned from Config to VM via New().
+func TestVMDependenciesAssignedNonNil(t *testing.T) {
+	cfg := testConfig(t)
+	nm := &network.Manager{}
+	cfg.NetworkManager = nm
+
+	vm, err := New(cfg, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		os.RemoveAll(vm.res.Dir)
+	})
+
+	require.Same(t, nm, vm.NetworkManager)
+}
+
+// TestVMSharedNetworkManagerNotOwned verifies that when a shared NetworkManager
+// is injected via Config, the VM does not own it (ownNetworkMgr stays false).
+func TestVMSharedNetworkManagerNotOwned(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Network = &NetworkConfig{Enabled: true, Bridge: "test-br", CIDR: "10.0.0.0/24"}
+	cfg.NetworkManager = &network.Manager{}
+
+	vm, err := New(cfg, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		os.RemoveAll(vm.res.Dir)
+	})
+
+	require.Same(t, cfg.NetworkManager, vm.NetworkManager)
+	require.False(t, vm.ownNetworkMgr)
+}
+
+// TestVMPrivateNetworkManagerCreation verifies that when Network is enabled but
+// no NetworkManager is injected, the VM creates its own and owns it.
+func TestVMPrivateNetworkManagerCreation(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Network = &NetworkConfig{Enabled: true, Bridge: "test-br", CIDR: "10.0.0.0/24"}
+	// No NetworkManager set; VM should create its own.
+
+	vm, err := New(cfg, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		os.RemoveAll(vm.res.Dir)
+	})
+
+	require.NotNil(t, vm.NetworkManager)
+	require.True(t, vm.ownNetworkMgr)
+}
+
+// TestSandboxVsockCIDValid verifies that NewSandbox assigns a valid vsock CID
+// (>= 3, since CIDs 0-2 are reserved by Firecracker).
+func TestSandboxVsockCIDValid(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.VsockCID = 0
+
+	sbox, err := NewSandbox(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		// No Firecracker was started, so just clean up the work dir.
+		os.RemoveAll(sbox.vm.res.Dir)
+	})
+
+	require.GreaterOrEqual(t, sbox.vm.cfg.VsockCID, uint32(3))
+	require.Greater(t, sbox.vm.cfg.VsockCID, uint32(0))
+}
+
+// TestSandboxUniqueVsockCIDWhenUnset verifies that NewSandbox assigns a unique
+// CID when none is explicitly set.
+func TestSandboxUniqueVsockCIDWhenUnset(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.VsockCID = 0
+
+	sbox, err := NewSandbox(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		os.RemoveAll(sbox.vm.res.Dir)
+	})
+
+	require.GreaterOrEqual(t, sbox.vm.cfg.VsockCID, uint32(3))
 }

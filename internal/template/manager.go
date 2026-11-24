@@ -235,5 +235,12 @@ type Config struct {
 	TemplateID string
 }
 
+// Store returns the underlying template store.
+func (m *TemplateManager) Store() *Store {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store
+}
+
 // Ensure TemplateManager satisfies image.TemplateChecker.
 var _ TemplateChecker = (*TemplateManager)(nil)

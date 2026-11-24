@@ -122,7 +122,7 @@ type StorageManager struct {
 	mu        sync.Mutex
 	rootDir   string
 	layerMgr  *LayerManager
-	nbdMgr    *NBDManager
+	nbdMgr    NBDManager
 	snapStore SnapshotStore
 	tmplStore *template.Store
 	metaStore *MetadataStore
@@ -140,7 +140,7 @@ type StorageManager struct {
 // nil is allowed for direct-rootfs-only usage.
 func NewStorageManager(rootDir string,
 	layerMgr *LayerManager,
-	nbdMgr *NBDManager,
+	nbdMgr NBDManager,
 	snapStore SnapshotStore,
 	tmplStore *template.Store,
 ) *StorageManager {
@@ -158,6 +158,35 @@ func NewStorageManager(rootDir string,
 	}
 }
 
+// NewStorageManagerWithMetadataStore creates a StorageManager using the
+// supplied MetadataStore. Pass the same instance to ImageManager,
+// VolumeManager, and other metadata consumers.
+func NewStorageManagerWithMetadataStore(
+	rootDir string,
+	layerMgr *LayerManager,
+	nbdMgr NBDManager,
+	snapStore SnapshotStore,
+	tmplStore *template.Store,
+	metaStore *MetadataStore,
+) *StorageManager {
+	if metaStore == nil {
+		metaStore = NewMetadataStore(rootDir)
+	}
+
+	return &StorageManager{
+		rootDir:      rootDir,
+		layerMgr:     layerMgr,
+		nbdMgr:       nbdMgr,
+		snapStore:    snapStore,
+		tmplStore:    tmplStore,
+		metaStore:    metaStore,
+		resources:    make(map[string]*StorageResource),
+		vmOverlays:   make(map[string]string),
+		templateVMs:  make(map[string]map[string]struct{}),
+		snapOverlays: make(map[string]string),
+	}
+}
+
 // WithLogger returns a StorageManager with the given logger for structured
 // storage lifecycle logging.
 func (sm *StorageManager) WithLogger(logger Logger) *StorageManager {
@@ -165,6 +194,13 @@ func (sm *StorageManager) WithLogger(logger Logger) *StorageManager {
 	defer sm.mu.Unlock()
 	sm.logger = logger
 	return sm
+}
+
+// MetadataStore returns the shared MetadataStore used by this StorageManager.
+func (sm *StorageManager) MetadataStore() *MetadataStore {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.metaStore
 }
 
 // EnsureDirs creates all required storage directories.

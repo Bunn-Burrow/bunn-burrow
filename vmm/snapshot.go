@@ -942,7 +942,7 @@ type RestoreOpts struct {
 //
 // The snapshot must be in the "ready" state and its artifacts must exist.
 func RestoreSnapshot(ctx context.Context, store *SnapshotStore, snapID string,
-	ts *template.Store, lm *storage.LayerManager, nm *storage.NBDManager,
+	ts *template.Store, lm *storage.LayerManager, nm storage.NBDManager,
 	opts RestoreOpts, logger *logrus.Entry) (*VM, error) {
 
 	if logger == nil {

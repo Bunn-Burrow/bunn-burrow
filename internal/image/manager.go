@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Bunn-Burrow/bunn-burrow/internal/template"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -20,6 +21,22 @@ type Manager struct {
 // NewManager creates an image manager with the given cache directory.
 func NewManager(cacheDir string) *Manager {
 	return &Manager{cacheDir: cacheDir}
+}
+
+// InspectImage resolves an image reference and returns basic image info.
+// It implements template.ImageResolver.
+func (m *Manager) InspectImage(id string) (*template.ImageInfo, error) {
+	ref, err := name.ParseReference(id)
+	if err != nil {
+		return nil, fmt.Errorf("parse image reference %q: %w", id, err)
+	}
+	if _, err := remote.Get(ref); err != nil {
+		return nil, fmt.Errorf("inspect image %q: %w", id, err)
+	}
+	return &template.ImageInfo{
+		ID:    id,
+		State: "active",
+	}, nil
 }
 
 // Resolve resolves an image reference to a v1.Image.

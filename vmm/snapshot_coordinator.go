@@ -40,8 +40,29 @@ type SnapshotCoordinator struct {
 	snapStore *SnapshotStore
 	layerMgr  *storage.LayerManager
 	tmplStore *template.Store
-	nbdMgr    *storage.NBDManager
+	nbdMgr    storage.NBDManager
 	logger    *logrus.Entry
+}
+
+// Store returns the underlying SnapshotStore.
+func (sc *SnapshotCoordinator) Store() *SnapshotStore {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.snapStore
+}
+
+// TemplateStore returns the underlying template store.
+func (sc *SnapshotCoordinator) TemplateStore() *template.Store {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.tmplStore
+}
+
+// NBDManager returns the underlying NBD manager.
+func (sc *SnapshotCoordinator) NBDManager() storage.NBDManager {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.nbdMgr
 }
 
 // NewSnapshotCoordinator creates a coordinator for VM snapshots.
@@ -49,7 +70,7 @@ func NewSnapshotCoordinator(
 	snapStore *SnapshotStore,
 	layerMgr *storage.LayerManager,
 	tmplStore *template.Store,
-	nbdMgr *storage.NBDManager,
+	nbdMgr storage.NBDManager,
 	logger *logrus.Entry,
 ) *SnapshotCoordinator {
 	if logger == nil {

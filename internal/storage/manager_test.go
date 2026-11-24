@@ -261,3 +261,65 @@ func TestStorageManagerCollectGarbageExec(t *testing.T) {
 	// Verify file was deleted.
 	require.NoFileExists(t, tmpFile)
 }
+
+func TestNewStorageManagerWithMetadataStore(t *testing.T) {
+	rootDir := t.TempDir()
+	tmplStore := template.New(rootDir)
+	require.NoError(t, tmplStore.EnsureDirs())
+
+	layerMgr := NewLayerManager(rootDir, tmplStore)
+	require.NoError(t, layerMgr.EnsureDirs())
+	nbdMgr := NewNBDManager(0, 16, "/dev", "/var/lock")
+	mockSnapStore := newMockSnapshotStore()
+
+	// Create a shared MetadataStore.
+	metaStore := NewMetadataStore(filepath.Join(rootDir, "metadata"))
+	require.NoError(t, metaStore.EnsureDirs())
+
+	sm := NewStorageManagerWithMetadataStore(rootDir, layerMgr, nbdMgr, mockSnapStore, tmplStore, metaStore)
+	require.NotNil(t, sm)
+	require.Same(t, metaStore, sm.metaStore)
+
+	// Verify the manager is functional.
+	vmID := "test-vm"
+	overlayPath := filepath.Join(rootDir, "layers", vmID+".qcow2")
+	nbdDevice := "/dev/nbd0"
+
+	err := sm.RegisterVM(vmID, "", overlayPath, nbdDevice)
+	require.NoError(t, err)
+
+	vmRes := sm.metaStore.Get("vm:" + vmID)
+	require.NotNil(t, vmRes)
+	require.Equal(t, StateActive, vmRes.State)
+}
+
+func TestNewStorageManagerCompatibilityWrapper(t *testing.T) {
+	rootDir := t.TempDir()
+	tmplStore := template.New(rootDir)
+	require.NoError(t, tmplStore.EnsureDirs())
+
+	layerMgr := NewLayerManager(rootDir, tmplStore)
+	require.NoError(t, layerMgr.EnsureDirs())
+	nbdMgr := NewNBDManager(0, 16, "/dev", "/var/lock")
+	mockSnapStore := newMockSnapshotStore()
+
+	// The compatibility wrapper should still work and create its own MetadataStore.
+	sm := NewStorageManager(rootDir, layerMgr, nbdMgr, mockSnapStore, tmplStore)
+	require.NotNil(t, sm)
+	require.NotNil(t, sm.metaStore)
+	require.NotEqual(t, rootDir, sm.metaStore.dir)
+	require.Equal(t, filepath.Join(rootDir, "resources"), sm.metaStore.dir)
+
+	// Verify the manager is functional.
+	vmID := "test-vm-2"
+	overlayPath := filepath.Join(rootDir, "layers", vmID+".qcow2")
+	nbdDevice := "/dev/nbd1"
+
+	require.NoError(t, sm.EnsureDirs())
+	err := sm.RegisterVM(vmID, "", overlayPath, nbdDevice)
+	require.NoError(t, err)
+
+	vmRes := sm.metaStore.Get("vm:" + vmID)
+	require.NotNil(t, vmRes)
+	require.Equal(t, StateActive, vmRes.State)
+}

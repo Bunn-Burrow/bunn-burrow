@@ -39,6 +39,35 @@ type NBDDevice struct {
 	startedAt time.Time
 }
 
+// NBDManager is the interface for mapping qcow2 images to NBD block devices.
+// Implementations may use qemu-nbd (production) or in-memory fakes (tests).
+type NBDManager interface {
+	// Map exposes the qcow2 image at imagePath as an NBD block device owned by
+	// vmID. It returns the device path (e.g. /dev/nbd0).
+	Map(ctx context.Context, imagePath, vmID string) (string, error)
+
+	// Unmap disconnects the NBD device owned by vmID and stops the qemu-nbd
+	// process. It is idempotent: unmapping an unknown VM is not an error.
+	Unmap(vmID string) error
+
+	// UnmapContext disconnects the NBD device owned by vmID and stops the
+	// qemu-nbd process, honoring context cancellation for the termination wait.
+	UnmapContext(ctx context.Context, vmID string) error
+
+	// DevicePath returns the NBD device path for vmID, or empty string if
+	// unmapped.
+	DevicePath(vmID string) string
+
+	// IsMapped reports whether vmID currently has an NBD device mapped.
+	IsMapped(vmID string) bool
+
+	// ReconcileNBD detects stale NBD mappings owned by this manager and cleans
+	// them up. It inspects actual system state (NBD devices, qemu-nbd lock
+	// files, qemu-nbd processes) rather than relying solely on in-memory
+	// mappings.
+	ReconcileNBD(ctx context.Context) (*NBDReconcileReport, error)
+}
+
 // NBDManager manages qemu-nbd processes that expose qcow2 images as NBD block
 // devices. Each VM receives a unique NBD device so Firecracker can boot from
 // the VM's writable qcow2 overlay. The backing image remains immutable.
@@ -47,7 +76,7 @@ type NBDDevice struct {
 // same NBD device, preventing concurrent write conflicts. The manager does not
 // persist mappings across process restarts; orphaned NBD devices from crashed
 // VMs must be cleaned up manually via ReconcileNBD.
-type NBDManager struct {
+type nbdManager struct {
 	mu      sync.Mutex
 	devices map[int]*NBDDevice    // by NBD device number
 	byVM    map[string]*NBDDevice // by VM ID
@@ -62,7 +91,7 @@ type NBDManager struct {
 // NewNBDManager creates an NBD manager that allocates devices from startNBD to
 // maxNBD (exclusive). nbdDir is the directory containing /dev/nbd* devices
 // (typically "/dev"). lockDir is the qemu-nbd lock directory.
-func NewNBDManager(startNBD, maxNBD int, nbdDir, lockDir string) *NBDManager {
+func NewNBDManager(startNBD, maxNBD int, nbdDir, lockDir string) NBDManager {
 	if startNBD < 0 {
 		startNBD = 0
 	}
@@ -75,7 +104,7 @@ func NewNBDManager(startNBD, maxNBD int, nbdDir, lockDir string) *NBDManager {
 	if lockDir == "" {
 		lockDir = "/var/lock"
 	}
-	return &NBDManager{
+	return &nbdManager{
 		devices: make(map[int]*NBDDevice),
 		byVM:    make(map[string]*NBDDevice),
 		nextNBD: startNBD,
@@ -94,7 +123,7 @@ func NewNBDManager(startNBD, maxNBD int, nbdDir, lockDir string) *NBDManager {
 //
 // Context cancellation aborts the operation. On cancellation, any partially
 // created mapping is cleaned up.
-func (m *NBDManager) Map(ctx context.Context, imagePath, vmID string) (string, error) {
+func (m *nbdManager) Map(ctx context.Context, imagePath, vmID string) (string, error) {
 	m.mu.Lock()
 	if d, ok := m.byVM[vmID]; ok {
 		m.mu.Unlock()
@@ -151,7 +180,7 @@ func (m *NBDManager) Map(ctx context.Context, imagePath, vmID string) (string, e
 // process. It is idempotent: unmapping an unknown VM is not an error. The
 // NBD device number is released for reuse. Context cancellation is honored
 // for the termination wait.
-func (m *NBDManager) UnmapContext(ctx context.Context, vmID string) error {
+func (m *nbdManager) UnmapContext(ctx context.Context, vmID string) error {
 	m.mu.Lock()
 	d, ok := m.byVM[vmID]
 	if !ok {
@@ -187,12 +216,12 @@ func (m *NBDManager) UnmapContext(ctx context.Context, vmID string) error {
 // Unmap disconnects the NBD device owned by vmID and stops the qemu-nbd
 // process. It is idempotent: unmapping an unknown VM is not an error. The
 // NBD device number is released for reuse.
-func (m *NBDManager) Unmap(vmID string) error {
+func (m *nbdManager) Unmap(vmID string) error {
 	return m.UnmapContext(context.Background(), vmID)
 }
 
 // DevicePath returns the NBD device path for vmID, or empty string if unmapped.
-func (m *NBDManager) DevicePath(vmID string) string {
+func (m *nbdManager) DevicePath(vmID string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if d, ok := m.byVM[vmID]; ok {
@@ -202,7 +231,7 @@ func (m *NBDManager) DevicePath(vmID string) string {
 }
 
 // IsMapped reports whether vmID currently has an NBD device mapped.
-func (m *NBDManager) IsMapped(vmID string) bool {
+func (m *nbdManager) IsMapped(vmID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_, ok := m.byVM[vmID]
@@ -210,7 +239,7 @@ func (m *NBDManager) IsMapped(vmID string) bool {
 }
 
 // allocateNBD finds and marks the next free NBD device number.
-func (m *NBDManager) allocateNBD() (int, error) {
+func (m *nbdManager) allocateNBD() (int, error) {
 	for i := 0; i < m.maxNBD-m.nextNBD; i++ {
 		n := (m.nextNBD + i) % m.maxNBD
 		if _, ok := m.devices[n]; !ok {
@@ -223,7 +252,7 @@ func (m *NBDManager) allocateNBD() (int, error) {
 
 // startQemuNBD launches qemu-nbd to connect image to device. The process runs
 // in the foreground and is stored in d.proc so it can be terminated on unmap.
-func (m *NBDManager) startQemuNBD(d *NBDDevice) error {
+func (m *nbdManager) startQemuNBD(d *NBDDevice) error {
 	cmd := exec.Command("qemu-nbd", "-f", "qcow2", "-c", d.Device, d.Image)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("launch qemu-nbd: %w", err)
@@ -235,7 +264,7 @@ func (m *NBDManager) startQemuNBD(d *NBDDevice) error {
 
 // waitForDeviceCtx polls the NBD device path until it is statable as a block
 // device, bounded by a short timeout and honoring context cancellation.
-func (m *NBDManager) waitForDeviceCtx(ctx context.Context, device string) error {
+func (m *nbdManager) waitForDeviceCtx(ctx context.Context, device string) error {
 	deadline := time.Now().Add(10 * time.Second)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -259,7 +288,7 @@ func (m *NBDManager) waitForDeviceCtx(ctx context.Context, device string) error 
 // expected image by reading /proc/PID/cmdline and checking that the image
 // path appears as an argument. This catches cases where qemu-nbd started
 // but is not actually serving our image.
-func (m *NBDManager) verifyMapping(d *NBDDevice) error {
+func (m *nbdManager) verifyMapping(d *NBDDevice) error {
 	if d.proc == nil {
 		return fmt.Errorf("qemu-nbd process is nil")
 	}
@@ -383,7 +412,7 @@ func ListNBDDevices(nbdDir, lockDir string) ([]NBDMappingRecord, error) {
 //
 // Returns a report of devices still mapped (in-memory), devices found orphaned
 // (lock file removed), and devices left alone (owned by others).
-func (m *NBDManager) ReconcileNBD(ctx context.Context) (*NBDReconcileReport, error) {
+func (m *nbdManager) ReconcileNBD(ctx context.Context) (*NBDReconcileReport, error) {
 	m.mu.Lock()
 	tracked := make(map[int]*NBDDevice, len(m.devices))
 	for n, d := range m.devices {

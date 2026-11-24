@@ -115,7 +115,7 @@ type VolumeManager struct {
 	mu        sync.Mutex
 	cfg       VolumeConfig
 	layerMgr  *LayerManager
-	nbdMgr    *NBDManager
+	nbdMgr    NBDManager
 	metaStore *MetadataStore
 
 	// volumes is the in-memory index of all known volumes, rebuilt from the
@@ -128,7 +128,7 @@ type VolumeManager struct {
 
 // NewVolumeManager creates a VolumeManager. layerMgr and nbdMgr may be nil for
 // metadata-only usage, but are required for actual volume creation and attach.
-func NewVolumeManager(cfg VolumeConfig, layerMgr *LayerManager, nbdMgr *NBDManager, metaStore *MetadataStore) *VolumeManager {
+func NewVolumeManager(cfg VolumeConfig, layerMgr *LayerManager, nbdMgr NBDManager, metaStore *MetadataStore) *VolumeManager {
 	if cfg.MinSizeBytes <= 0 {
 		cfg.MinSizeBytes = DefaultVolumeConfig(cfg.RootDir).MinSizeBytes
 	}
@@ -694,4 +694,11 @@ func (m *VolumeManager) Config() VolumeConfig {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.cfg
+}
+
+// MetadataStore returns the shared MetadataStore used by this VolumeManager.
+func (m *VolumeManager) MetadataStore() *MetadataStore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.metaStore
 }

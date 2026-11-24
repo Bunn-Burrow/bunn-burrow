@@ -93,6 +93,14 @@ type Config struct {
 	// template-based VM creation is unavailable.
 	TemplateManager *template.TemplateManager
 
+	TemplateStore *template.Store
+
+	LayerManager *storage.LayerManager
+
+	NBDManager storage.NBDManager
+
+	StorageManager *storage.StorageManager
+
 	// Volumes lists volumes to attach to this VM at startup. Each volume is
 	// attached before guest execution and detached on VM stop/destroy.
 	Volumes []storage.VolumeRef
